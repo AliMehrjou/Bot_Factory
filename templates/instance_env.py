@@ -18,6 +18,7 @@ def render_instance_env(
     fernet_key: str,
     force_join: str = "",
     login_proxy_url: str = "",
+    video_link: str = "", 
     pool_size: int = 10,
     max_overflow: int = 20,
     max_accounts_per_proxy: int = 20,

@@ -370,6 +370,7 @@ async def provision(order: Order) -> dict:
             login_proxy_url=login_proxy_url,
             pool_size=pool_size,
             max_overflow=max_overflow,
+            video_link=config.VIDEO_LINK, 
         )
         env_path = inst / ".env"
         with open(os.open(env_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600), 'w', encoding="utf-8") as f:
