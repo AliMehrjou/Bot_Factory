@@ -23,7 +23,7 @@ from config import config
 from database.engine import init_db, close_all
 from core.deploy_queue import deploy_queue
 from core import proxy_manager, health_monitor
-from bot.handlers import user_router, info_router, admin_router, proxy_router
+from bot.handlers import user_router, info_router, admin_router, proxy_router, instance_proxy_router
 from bot.middlewares import AdminMiddleware
 from aiogram.client.session.aiohttp import AiohttpSession
 
@@ -55,6 +55,8 @@ async def on_startup(bot: Bot):
     
     proxy_manager.set_notifier(notify_admins)
     health_monitor.set_notifier(notify_admins)
+    from core import instance_proxies
+    instance_proxies.set_notifier(notify_admins)
 
     await deploy_queue.start()
     
@@ -137,7 +139,7 @@ async def on_startup(bot: Bot):
         except Exception as e:
             logger.warning("عدم امکان ثبت منوی ادمین برای %s: %s", admin_id, e)
 
-    msg = "🏭 <b>ربات‌ساز روشن شد</b>\nپنل: /panel | پروکسی‌ها: /proxies"
+    msg = "🏭 <b>ربات‌ساز روشن شد</b>\nپنل: /panel | استخر پروکسی: /proxies | پروکسی هر اینستنس: /panel → مدیریت پروکسی‌ها"
     for admin_id in config.ADMIN_IDS:
         try:
             await bot.send_message(admin_id, msg)
@@ -171,8 +173,10 @@ async def main():
     admin_router.callback_query.middleware(AdminMiddleware())
     proxy_router.message.middleware(AdminMiddleware())
     proxy_router.callback_query.middleware(AdminMiddleware())
+    instance_proxy_router.message.middleware(AdminMiddleware())
+    instance_proxy_router.callback_query.middleware(AdminMiddleware())
 
-    dp.include_routers(user_router, info_router, admin_router, proxy_router)
+    dp.include_routers(user_router, info_router, admin_router, proxy_router, instance_proxy_router)
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
 

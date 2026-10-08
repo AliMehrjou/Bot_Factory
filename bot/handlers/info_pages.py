@@ -1,14 +1,14 @@
 """
-📖 صفحات اطلاعاتی منوی اصلی — فان سندر
+📖 صفحات اطلاعاتی منوی اصلی — فان سندر (نسخه ۳)
 ========================================
 دکمه‌های منوی اصلی که صفحه اختصاصی دارند، در این فایل پیاده‌سازی شده‌اند:
 
   ❓ ربات سندر چیه؟        → callback: usr:whatis
   ✨ مزایای فان سندر       → callback: usr:benefits
   📜 قوانین ما (مهم)       → callback: usr:rules
-  💳 شارژ حساب             → callback: usr:charge      (شماره کارت از .env)
-  📱 نیاز به اکانت؟        → callback: usr:virtual     (معرفی تیم Plus Number)
-  🎧 راهنما و پشتیبانی     → callback: usr:help
+  💳 شارژ حساب             → callback: usr:charge      (قیمت پنل‌ها + هدایت به پیوی پشتیبانی)
+  📱 نیاز به اکانت؟        → callback: usr:virtual     (دکمه شیشه‌ای ربات خرید شماره مجازی)
+  🎧 راهنما و پشتیبانی     → callback: usr:help        (متن راهنمای جدید — متفاوت از متن سفارش)
   📨 سفارش ارسال به Pv     → callback: usr:pv          (سفارش تبلیغات ارسال به پی‌وی + ۳ دکمه شیشه‌ای)
   📜 قوانین سفارش (PV)     → callback: usr:pvrules     (قوانین و مقررات سفارش ارسال به پی‌وی)
   👤 پروفایل و موجودی      → callback: usr:profile
@@ -18,6 +18,9 @@
    و بدون نیاز به دست زدن به منطق کد، قابل ویرایش است. تگ‌های HTML مجاز:
    <b> <i> <code> <u> <s>
    (جایگاه {support} در متن قوانین، خودکار با SUPPORT_USERNAME از .env جایگزین می‌شود)
+
+🆕 نسخه ۳ — شارژ حساب فقط از طریق پیوی پشتیبانی انجام می‌شود؛
+   فلوی دریافت رسید داخل ربات حذف شد (پشتیبانی از پنل ادمین شارژ می‌کند).
 """
 import html
 import logging
@@ -25,23 +28,18 @@ import logging
 from aiogram import Bot, Router, F
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (CallbackQuery, Message, InlineKeyboardMarkup,
                            InlineKeyboardButton)
 from sqlalchemy import select, text
 
-from bot.keyboards import start_menu_kb, info_page_kb, pv_order_kb, pv_rules_kb
+from bot.keyboards import (start_menu_kb, info_page_kb, pv_order_kb, pv_rules_kb,
+                           virtual_page_kb, charge_page_kb)
 from config import config, fmt_price, parse_to_cents
 from database import async_session
 from database.models import Order
 
 logger = logging.getLogger(__name__)
 router = Router(name="info_pages")
-
-
-class ChargeFlow(StatesGroup):
-    waiting_for_receipt = State()
-    waiting_for_amount = State()
 
 
 # ============================================================
@@ -57,6 +55,16 @@ def _support_mention() -> str:
     """آیدی پشتیبانی به شکل @username برای نمایش داخل متن."""
     u = (config.SUPPORT_USERNAME or "").strip()
     return u if u.startswith("@") else f"@{u}"
+
+
+def _virtual_bot_url() -> str | None:
+    """لینک ربات خرید شماره مجازی (تیم Plus Number) از .env → لینک مستقیم تلگرام."""
+    raw = (config.VIRTUAL_NUMBER_BOT or "").strip()
+    if not raw:
+        return None
+    if raw.startswith("http://") or raw.startswith("https://"):
+        return raw
+    return f"https://t.me/{raw.lstrip('@')}"
 
 
 async def _show_page(cb: CallbackQuery, text: str, kb) -> None:
@@ -161,15 +169,26 @@ TEXT_RULES = (
 )
 
 TEXT_HELP = (
-    "ℹ️ <b>راهنما:</b>\n\n"
-    "برای ساخت ربات سندر اختصاصی خودتون توسط تیم فان سندر، ابتدا از طریق دکمه «شارژ حساب» به پی‌وی "
-    "پشتیبانی جهت افزایش اعتبار حساب خود مراجعه کنید.\n\n"
-    "💳 بعد از پرداخت و افزایش اعتبار شما در ربات توسط پشتیبانی، می‌توانید با استفاده از دکمه "
-    "«سفارش سندر»، ربات خودتون رو بسازید.\n\n"
-    "• 🤖 ربات شما به‌صورت خودکار روی سرور اختصاصی ساخته می‌شود\n"
-    "• 🔗 بعد از آماده شدن، لینک <code>t.me/YourBot</code> برایتان ارسال می‌شود\n"
-    "• 👑 ادمین ربات خودتان هستید؛ بعد از اولین /start در رباتتان، پنل مدیریت ظاهر می‌شود\n"
-    "• 🔒 سشن‌ها و داده‌های شما کاملاً ایزوله و رمزنگاری‌شده است"
+    "🎧 <b>راهنما و پشتیبانی</b>\n\n"
+    "🤖 <b>فان سندر چیه؟</b>\n"
+    "فان سندر پلتفرم ساخت <b>ربات سندر (ارسال به پی‌وی) اختصاصی</b> شماست؛ با آن می‌توانید "
+    "ممبرهای فعال گروه‌های تلگرام را استخراج کنید و بنر تبلیغاتی خود را برای آن‌ها ارسال کنید. 📢\n\n"
+    "🛍 <b>مراحل سفارش:</b>\n"
+    "1️⃣ از دکمه «💳 شارژ حساب»، قیمت پنل‌ها را ببینید و برای شارژ حساب به <b>پیوی پشتیبانی</b> مراجعه کنید.\n"
+    "2️⃣ از منوی اصلی، «🛍️ سفارش سندر» را بزنید و اشتراک دلخواهتان را انتخاب کنید.\n"
+    "3️⃣ طبق راهنمای ارسالی، توکن ربات خودتان را همین‌جا ارسال کنید.\n"
+    "4️⃣ سفارش شما ثبت شده و توسط <b>تیم پشتیبانی</b> در سریع‌ترین زمان ممکن ساخته و تحویل داده می‌شود. ✅\n\n"
+    "🔑 <b>توکن ربات ندارید؟</b>\n"
+    "آموزش کامل ساخت ربات در BotFather و دریافت توکن، داخل بخش سفارش (دکمه «📖 راهنمای دریافت توکن») "
+    "همراه ویدیوی آموزشی برایتان ارسال می‌شود.\n\n"
+    "🤖 <b>ربات‌های من</b>\n"
+    "وضعیت ربات‌های خریداری‌شده و تمدید اشتراک از دکمه «🤖 ربات‌های من» انجام می‌شود.\n\n"
+    "📱 <b>اکانت تلگرامی لازم دارید؟</b>\n"
+    "از بخش «📱 نیاز به اکانت تلگرامی؟» می‌توانید به ربات خرید شماره مجازی دسترسی داشته باشید.\n\n"
+    "📜 <b>قوانین</b>\n"
+    "پیش از ثبت سفارش، حتماً «⚖️ قوانین ما» را مطالعه کنید.\n\n"
+    "🧑‍💻 <b>پشتیبانی</b>\n"
+    "در تمام مراحل خرید و استفاده کنار شما هستیم؛ سوالی داشتید از طریق دکمه زیر در ارتباط باشید. 🤝"
 )
 
 TEXT_VIRTUAL = (
@@ -232,19 +251,29 @@ TEXT_PV_RULES = (
 
 
 def _text_charge() -> str:
-    """متن صفحه شارژ حساب — اطلاعات کارت از .env خوانده می‌شود."""
-    holder = f"👤 به نام: <b>{config.PAYMENT_CARD_HOLDER}</b>\n" if config.PAYMENT_CARD_HOLDER else ""
-    return (
-        "💳 <b>شارژ حساب</b>\n\n"
-        "برای پرداخت هزینه سفارش‌ها، حساب خود را از طریق کارت به کارت شارژ کنید:\n\n"
-        f"💳 شماره کارت: <code>{config.PAYMENT_CARD}</code>\n"
-        f"{holder}"
-        f"💰 مبلغ: معادل {config.CURRENCY}یِ همان مبلغ سفارش، یا هر مبلغ موردنظر برای شارژ\n\n"
-        f"📌 {config.PAYMENT_NOTE}\n\n"
-        "✅ پس از واریز، <b>تصویر رسید</b> را در همین گفتگو ارسال کنید تا پرداخت تأیید و "
-        "حسابتان شارژ شود.\n\n"
-        "سوالی درباره پرداخت دارید؟ با پشتیبانی در ارتباط باشید. 🧑‍💻"
+    """🆕 متن صفحه شارژ حساب (نسخه ۳):
+    قیمت هر پنل نمایش داده می‌شود و کاربر برای شارژ به پیوی پشتیبانی هدایت می‌شود.
+    (شارژ حساب توسط پشتیبانی و از طریق پنل ادمین انجام می‌شود.)"""
+    lines = [
+        "💳 <b>شارژ حساب</b>",
+        "",
+        "💰 <b>هزینه پنل‌ها جهت شارژ حساب:</b>",
+        "",
+    ]
+    for p in config.PLANS.values():
+        lines.append(
+            f"▫️ اشتراک <b>{p['title']}</b> ({p['days']} روز): "
+            f"<b>{fmt_price(p['price'])} {config.CURRENCY}</b>"
+        )
+    lines.append("")
+    lines.append(
+        "📌 برای شارژ حساب، به <b>پیوی پشتیبانی</b> مراجعه کنید و موجودی حساب خود را "
+        "<b>طبق پنل مورد نظرتان</b> با پشتیبانی هماهنگ کنید.\n\n"
+        "✅ پس از پرداخت و تأیید پشتیبانی، حساب شما شارژ می‌شود و می‌توانید از داخل ربات، "
+        "سفارش خود را ثبت کنید.\n\n"
+        f"🧑‍💻 پشتیبانی: {_support_mention()}"
     )
+    return "\n".join(lines)
 
 
 # ============================================================
@@ -279,16 +308,17 @@ async def cb_help(cb: CallbackQuery):
 
 
 @router.callback_query(F.data == "usr:charge")
-async def cb_charge(cb: CallbackQuery, state: FSMContext):
+async def cb_charge(cb: CallbackQuery):
+    """🆕 شارژ حساب — قیمت پنل‌ها + هدایت به پیوی پشتیبانی (بدون FSM و بدون رسید)."""
     await cb.answer()
-    await state.set_state(ChargeFlow.waiting_for_receipt)
-    await _show_page(cb, _text_charge(), info_page_kb(support_url=_support_url()))
+    await _show_page(cb, _text_charge(), charge_page_kb(_support_url()))
 
 
 @router.callback_query(F.data == "usr:virtual")
 async def cb_virtual(cb: CallbackQuery):
+    """🆕 اکانت مجازی — به‌جای دکمه پشتیبانی، دکمه شیشه‌ای ربات خرید شماره مجازی."""
     await cb.answer()
-    await _show_page(cb, TEXT_VIRTUAL, info_page_kb(support_url=_support_url()))
+    await _show_page(cb, TEXT_VIRTUAL, virtual_page_kb(_virtual_bot_url()))
 
 
 # ============================================================
@@ -335,78 +365,10 @@ async def _has_active_bots(tg_id: int) -> bool:
 
 
 # ============================================================
-# فلوی شارژ حساب (رسید + مبلغ → تأیید ادمین)
+# 🆕 نسخه ۳ — فلوی «رسید شارژ» حذف شد:
+# شارژ حساب فقط از طریق پیوی پشتیبانی انجام می‌شود؛ پشتیبانی پس از دریافت پرداخت،
+# از پنل ادمین (دکمه «💳 شارژ حساب کاربر») موجودی کاربر را شارژ می‌کند.
 # ============================================================
-@router.message(ChargeFlow.waiting_for_receipt, F.photo | F.document)
-async def st_charge_receipt(message: Message, state: FSMContext):
-    is_photo = bool(message.photo)
-    file_id = message.photo[-1].file_id if is_photo else message.document.file_id
-
-    # ذخیره فایل در وضعیت و رفتن به مرحله دریافت مبلغ
-    await state.update_data(receipt_file_id=file_id, is_photo=is_photo)
-    await message.answer(
-        "✅ تصویر رسید دریافت شد.\n\n"
-        f"💰 <b>لطفاً دقیقاً مبلغی که واریز کرده‌اید را به {config.CURRENCY} وارد کنید (فقط عدد):</b>\n"
-        "<i>مثال: 3.5 یا 10</i>\n\n"
-        "برای لغو /cancel را ارسال کنید."
-    )
-    await state.set_state(ChargeFlow.waiting_for_amount)
-
-
-@router.message(ChargeFlow.waiting_for_receipt)
-async def st_charge_invalid(message: Message):
-    await message.answer("❌ لطفاً فقط <b>تصویر رسید واریز</b> را بفرستید (عکس یا فایل).")
-
-
-@router.message(ChargeFlow.waiting_for_amount, F.text)
-async def st_charge_amount(message: Message, state: FSMContext, bot: Bot):
-    claimed_cents = parse_to_cents(message.text)
-    if claimed_cents is None:
-        return await message.answer("❌ لطفاً فقط عدد وارد کنید (مثلاً 3.5 یا 10):")
-
-    data = await state.get_data()
-    file_id = data.get("receipt_file_id")
-    is_photo = data.get("is_photo")
-
-    mention = f"@{message.from_user.username}" if message.from_user.username else message.from_user.full_name
-    mention = html.escape(mention)
-
-    # دریافت موجودی فعلی کاربر برای نمایش مستقیم به ادمین
-    async with async_session() as session:
-        balance = await session.scalar(
-            text("SELECT balance FROM users WHERE tg_id = :uid"), {"uid": message.from_user.id}
-        ) or 0
-
-    admin_text = (
-        f"💰 <b>درخواست شارژ حساب</b>\n\n"
-        f"👤 کاربر: {mention} (<code>{message.from_user.id}</code>)\n"
-        f"💵 موجودی فعلی کاربر: <b>{fmt_price(balance)} {config.CURRENCY}</b>\n"
-        f"💳 مبلغ واریزی (اعلام شده توسط کاربر): <b>{fmt_price(claimed_cents)} {config.CURRENCY}</b>\n\n"
-        "لطفاً پس از بررسی رسید، از طریق دکمه زیر حساب کاربر را شارژ کنید."
-    )
-
-    # ارسال مبلغ پیشنهادیِ کاربر (به سنت) به عنوان دیتا به دکمه ادمین
-    charge_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text=f"💳 تأیید و شارژ ({fmt_price(claimed_cents)} {config.CURRENCY})",
-            callback_data=f"adm:charge:{message.from_user.id}:{claimed_cents}",
-        )]
-    ])
-
-    for admin_id in config.ADMIN_IDS:
-        try:
-            if is_photo:
-                await bot.send_photo(admin_id, file_id, caption=admin_text, reply_markup=charge_kb)
-            else:
-                await bot.send_document(admin_id, file_id, caption=admin_text, reply_markup=charge_kb)
-        except Exception:
-            pass
-
-    await message.answer(
-        "✅ <b>رسید و مبلغ با موفقیت برای پشتیبانی ارسال شد.</b>\n"
-        "پس از تأیید، حساب شما فوراً شارژ خواهد شد."
-    )
-    await state.clear()
 
 
 # ============================================================
@@ -425,7 +387,9 @@ async def cb_profile(cb: CallbackQuery):
         f"👤 <b>پروفایل شما</b>\n\n"
         f"شناسه عددی: <code>{cb.from_user.id}</code>\n"
         f"💰 موجودی کیف پول: <b>{fmt_price(balance)} {config.CURRENCY}</b>\n\n"
-        "با شارژ کیف پول می‌توانید سفارش‌های خود را در لحظه و بدون نیاز به تأیید ادمین ثبت کنید."
+        "برای ثبت سفارش، موجودی حساب شما باید معادل قیمت پلن باشد.\n"
+        "📌 شارژ حساب از طریق پیوی پشتیبانی انجام می‌شود؛ موجودی خود را طبق پلن مورد نظر "
+        "با پشتیبانی هماهنگ کنید."
     )
 
     kb = InlineKeyboardMarkup(inline_keyboard=[

@@ -85,6 +85,25 @@ class FactoryConfig:
     SUPPORT_USERNAME: str = os.getenv("SUPPORT_USERNAME", "@support_admin")
     MAX_PENDING_ORDERS: int = _int("MAX_PENDING_ORDERS", 3)
 
+    # ---------- 🛒 ربات خرید شماره مجازی ----------
+    # لینک/یوزرنیم ربات خرید شماره مجازی (تیم Plus Number) — دکمه شیشه‌ای صفحه «نیاز به اکانت تلگرامی؟»
+    # مثال: @PlusNumberBot  یا  https://t.me/PlusNumberBot
+    VIRTUAL_NUMBER_BOT: str = os.getenv("VIRTUAL_NUMBER_BOT", "@PlusNumberBot")
+
+    # ---------- 🎬 ویدیوی آموزشی توکن ----------
+    # file_id تلگرام ویدیوی آموزشی (fallback اولیه از .env).
+    # راه بهتر: پنل ادمین → «🎬 ویدیوی آموزشی» → آپلود مستقیم ویدیو؛
+    # فایل‌آیدی در دیتابیس ذخیره شده و از آن لحظه خودکار همراه متن‌های راهنما ارسال می‌شود.
+    # اگر هیچ‌کدام تنظیم نباشد، متن‌ها بدون ویدیو ارسال می‌شوند (بدون خطا).
+    # پیشوند نوع اختیاری است:  animation:<file_id>  یا  document:<file_id>  (پیش‌فرض: video)
+    TOKEN_GUIDE_VIDEO_FILE_ID: str = os.getenv("TOKEN_GUIDE_VIDEO_FILE_ID", "")
+
+    # ---------- 🔧 حالت ساخت دستی ----------
+    # true  = سفارش‌های پرداخت‌شده به‌جای دیپلوی خودکار، به پشتیبانی ارجاع می‌شوند
+    #         (پشتیبانی ایمیج ربات را می‌سازد و از پنل وضعیت را به‌روز می‌کند)
+    # false = رفتار قدیمی: پرداخت از کیف پول → ساخت خودکار فوری
+    MANUAL_BUILD_MODE: bool = _flag("MANUAL_BUILD_MODE", "true")
+
     # ---------- دیتابیس مرکزی فکتوری ----------
     DB_HOST: str = os.getenv("DB_HOST", "127.0.0.1")
     DB_PORT: int = _int("DB_PORT", 3306)
@@ -110,10 +129,6 @@ class FactoryConfig:
     FACTORY_DIR: str = os.getenv("FACTORY_DIR", "/opt/factory")
     BOT_IMAGE: str = os.getenv("BOT_IMAGE", "sender_bot:v1")
 
-    # لینک ویدیوی معرفی/آموزش — هنگام ساخت هر اینستنس به .env آن تزریق می‌شود
-    # (تغییر این مقدار فقط روی سفارش‌های جدید اثر دارد؛ خالی = متغیر خالی تزریق می‌شود)
-    VIDEO_LINK: str = os.getenv("VIDEO_LINK", "")
-
     # ---------- پرداخت و واحد پول ----------
     PAYMENT_CARD: str = os.getenv("PAYMENT_CARD", "6037-0000-0000-0000")
     PAYMENT_CARD_HOLDER: str = os.getenv("PAYMENT_CARD_HOLDER", "")
@@ -137,6 +152,19 @@ class FactoryConfig:
     PROXY_TEST_HOST: str = os.getenv("PROXY_TEST_HOST", "149.154.167.50")
     PROXY_TEST_PORT: int = _int("PROXY_TEST_PORT", 443)
     PROXY_NOTIFY_HEARTBEAT: int = _int("PROXY_NOTIFY_HEARTBEAT", 20)   # هر چند سیکل گزارش سلامت بدهد
+
+    # ---------- 🎯 تخصیص پروکسی به هر اینستنس (مدیریت تفکیک‌شده ادمین) ----------
+    # موقع provision اینستنس جدید، به‌صورت خودکار بهترین پروکسی‌های استخر به آن
+    # تخصیص می‌یابند (لاگین + سندر) تا مشتری هیچ دخالتی نداشته باشد.
+    AUTO_ASSIGN_ON_PROVISION: bool = _flag("AUTO_ASSIGN_ON_PROVISION", "true")
+    # تعداد پروکسی لاگین که خودکار به اینستنس جدید تخصیص می‌یابد (0 = بدون تخصیص خودکار لاگین)
+    AUTO_ASSIGN_LOGIN_COUNT: int = _int("AUTO_ASSIGN_LOGIN_COUNT", 10)
+    # تعداد پروکسی سندر که خودکار به اینستنس جدید تخصیص می‌یابد (0 = بدون تخصیص خودکار سندر)
+    AUTO_ASSIGN_SENDER_COUNT: int = _int("AUTO_ASSIGN_SENDER_COUNT", 10)
+    # سقف تعداد خط پروکسی که ادمین در یک پیام برای یک اینستنس می‌فرستد
+    INSTANCE_PROXY_MAX_LINES: int = _int("INSTANCE_PROXY_MAX_LINES", 300)
+    # هشدار کمبود: اگر سهمیه سالم یک اینستنس از این عدد کمتر شود ادمین هشدار می‌گیرد
+    INSTANCE_PROXY_MIN_HEALTHY: int = _int("INSTANCE_PROXY_MIN_HEALTHY", 3)
 
     # ---------- منابع اینستنس‌ها (تله شماره ۴: محدودسازی منابع) ----------
     # برای ۵۰ اینستنس همزمان: 50×512m = 25.6GB سقف (سرور پیشنهادی: 32GB RAM / 8vCPU)

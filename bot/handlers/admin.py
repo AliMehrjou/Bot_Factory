@@ -13,7 +13,7 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from sqlalchemy import select, func, update
+from sqlalchemy import select, func, update, text
 
 from bot.keyboards import admin_panel_kb, confirm_destroy_kb
 from config import config, fmt_price, parse_to_cents
@@ -145,40 +145,62 @@ async def cb_approval(cb: CallbackQuery, bot: Bot):
         if not order or order.status != 'awaiting_approval':
             return await cb.answer("این سفارش قبلاً پردازش شده یا وجود ندارد.", show_alert=True)
 
+        # 🆕 آیا مبلغ این سفارش موقع ثبت از کیف پول پرداخت شده؟
+        # (اگر بله: دیگر نباید دوباره کسر شود و در صورت رد، کل مبلغ عودت داده می‌شود)
+        wallet_paid = (order.receipt_file_id == "wallet_paid")
+
         if verdict == "no":
             order.status = 'rejected'
+
+            # 🆕 عودت وجه برای سفارش‌های پرداخت‌شده از کیف پول
+            # (با ORM — سازگار با MySQL و SQLite)
+            refund_text = ""
+            if wallet_paid:
+                from database.models import User
+                u = await session.get(User, order.tg_id)
+                if u:
+                    u.balance = (u.balance or 0) + order.price
+                else:
+                    session.add(User(tg_id=order.tg_id, balance=order.price))
+                refund_text = (
+                    f"\n💰 مبلغ <b>{fmt_price(order.price)} {config.CURRENCY}</b> "
+                    "به کیف پول شما بازگردانده شد."
+                )
+
             await session.commit()
-            
+
             try:
                 if cb.message.photo:
                     await cb.message.edit_caption(caption=(cb.message.caption or "") + f"\n\n❌ <b>سفارش #{order_id} رد شد</b>", reply_markup=None)
                 else:
                     await cb.message.edit_text(f"❌ سفارش #{order_id} رد شد.", reply_markup=None)
             except Exception: pass
-                
+
             try:
                 await bot.send_message(
                     order.tg_id,
-                    f"متأسفانه سفارش #{order_id} شما تأیید نشد.\n"
+                    f"متأسفانه سفارش #{order_id} شما تأیید نشد.{refund_text}\n"
                     f"برای بررسی بیشتر با پشتیبانی ({getattr(config, 'SUPPORT_USERNAME', 'مدیریت')}) در ارتباط باشید."
                 )
             except Exception: pass
-            return await cb.answer("رد شد")
+            return await cb.answer("رد شد" + (" و وجه عودت داده شد" if wallet_paid else ""))
 
         # اگر تأیید شد
         now_dt = dt.datetime.now(dt.timezone.utc)
         order.approved_at = now_dt
-        
-        # === شروع کسر اتوماتیک از کیف پول ===
-        from sqlalchemy import text
-        user_balance = await session.scalar(text("SELECT balance FROM users WHERE tg_id = :uid"), {"uid": order.tg_id}) or 0
-        if user_balance > 0:
-            # کسر موجودی به اندازه کل قیمت یا هرچقدر که در کیف پولش مانده
-            deduct_amount = min(user_balance, order.price)
-            await session.execute(
-                text("UPDATE users SET balance = balance - :amount WHERE tg_id = :uid"), 
-                {"amount": deduct_amount, "uid": order.tg_id}
-            )
+
+        # === کسر اتوماتیک از کیف پول ===
+        # 🆕 فقط برای سفارش‌هایی که هنوز از کیف پول پرداخت نشده‌اند (رسید قدیمی/دستی)؛
+        # سفارش‌های «wallet_paid» موقع ثبت خودشان کسر شده‌اند.
+        if not wallet_paid:
+            user_balance = await session.scalar(text("SELECT balance FROM users WHERE tg_id = :uid"), {"uid": order.tg_id}) or 0
+            if user_balance > 0:
+                # کسر موجودی به اندازه کل قیمت یا هرچقدر که در کیف پولش مانده
+                deduct_amount = min(user_balance, order.price)
+                await session.execute(
+                    text("UPDATE users SET balance = balance - :amount WHERE tg_id = :uid"),
+                    {"amount": deduct_amount, "uid": order.tg_id}
+                )
         # === پایان کسر اتوماتیک ===
         
         # اگر سفارش از نوع تمدید باشد
@@ -364,7 +386,8 @@ def admin_instances_kb(page_orders, current_page: int, total_pages: int) -> Inli
             b.button(text=f"▶️ روشن {o.id}", callback_data=f"inst:start:{o.id}")
             
         b.button(text=f"💥 حذف {o.id}", callback_data=f"inst:destroy:{o.id}")
-        sizes.append(2)  # هر ربات دو دکمه در یک سطر
+        b.button(text=f"🌐 پروکسی {o.id}", callback_data=f"ipx:menu:{o.id}", style="primary")
+        sizes.append(3)  # سه دکمه در یک سطر: کنترل | حذف | پروکسی
         
     nav_buttons = 0
     if current_page > 1:
@@ -499,9 +522,58 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # اضافه شدن وضعیت جدید برای تأیید مبلغ
+# 🆕 waiting_for_user = شارژ دستی از پنل (آیدی کاربر → مبلغ → تأیید)
 class AdminChargeState(StatesGroup):
+    waiting_for_user = State()
     waiting_for_amount = State()
     confirm_amount = State()
+
+
+class AdminVideoState(StatesGroup):
+    """🎬 آپلود ویدیوی آموزشی توکن از پنل ادمین."""
+    waiting_media = State()
+
+
+# ============================================================
+# 🆕 شارژ دستی کاربر از پنل (نسخه ۳ — شارژ فقط از طریق پیوی پشتیبانی)
+# ============================================================
+@router.callback_query(F.data == "adm:chargeman")
+async def cb_admin_charge_manual(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    await cb.message.answer(
+        "💳 <b>شارژ حساب کاربر</b>\n\n"
+        "👤 لطفاً <b>شناسه عددی (ID)</b> کاربر را بفرستید:\n"
+        "<i>(کاربر شناسه خود را از صفحه «👤 پروفایل و موجودی» می‌تواند بردارد)</i>\n\n"
+        "برای لغو /cancel را بفرستید."
+    )
+    await state.set_state(AdminChargeState.waiting_for_user)
+
+
+@router.message(AdminChargeState.waiting_for_user, F.text)
+async def st_admin_charge_user_id(message: Message, state: FSMContext):
+    raw = (message.text or "").strip()
+    if raw.startswith("/"):
+        await state.clear()
+        return await message.answer("❌ عملیات لغو شد.")
+    if not raw.isdigit() or not (5 <= len(raw) <= 12):
+        return await message.answer("❌ شناسه عددی نامعتبر است. لطفاً فقط عدد ID کاربر را بفرستید (مثلاً 123456789):")
+
+    target_user_id = int(raw)
+
+    async with async_session() as session:
+        balance = await session.scalar(
+            text("SELECT balance FROM users WHERE tg_id = :uid"), {"uid": target_user_id}
+        ) or 0
+
+    await state.update_data(target_user_id=target_user_id)
+    await message.answer(
+        f"💰 <b>شارژ حساب کاربر</b> <code>{target_user_id}</code>\n\n"
+        f"💵 موجودی فعلی کاربر: <b>{fmt_price(balance)} {config.CURRENCY}</b>\n\n"
+        f"لطفاً <b>مبلغ</b> مورد نظر برای شارژ را به {config.CURRENCY} وارد کنید (مثلاً 3.5 یا 10):\n\n"
+        "<i>برای لغو /cancel را بفرستید.</i>"
+    )
+    await state.set_state(AdminChargeState.waiting_for_amount)
+
 
 @router.callback_query(F.data.startswith("adm:charge:"))
 async def cb_admin_start_charge(cb: CallbackQuery, state: FSMContext):
@@ -591,11 +663,13 @@ async def cb_admin_confirm_charge(cb: CallbackQuery, state: FSMContext, bot: Bot
     
     try:
         async with async_session() as session:
-            await session.execute(text("""
-                INSERT INTO users (tg_id, balance) 
-                VALUES (:uid, :amount) 
-                ON DUPLICATE KEY UPDATE balance = balance + :amount
-            """), {"uid": target_user_id, "amount": amount})
+            # شارژ با ORM (سازگار با MySQL و SQLite)
+            from database.models import User
+            u = await session.get(User, target_user_id)
+            if u:
+                u.balance = (u.balance or 0) + amount
+            else:
+                session.add(User(tg_id=target_user_id, balance=amount))
             await session.commit()
 
         # اطلاع‌رسانی به مشتری
@@ -615,3 +689,199 @@ async def cb_admin_confirm_charge(cb: CallbackQuery, state: FSMContext, bot: Bot
         await cb.message.edit_text(f"🔴 خطای سرور در شارژ حساب:\n<code>{e}</code>")
         
     await state.clear()
+
+# ============================================================
+# 🆕 نسخه ۳ — حالت ساخت دستی (پشتیبانی ایمیج ربات را می‌سازد)
+# mb:<order_id>:done    → پشتیبانی ربات را خارج از فکتوری ساخت؛ سفارش «تحویل‌شده» علامت می‌خورد
+# mb:<order_id>:refund  → رد سفارش + عودت کامل وجه به کیف پول مشتری
+# ============================================================
+@router.callback_query(F.data.startswith("mb:"))
+async def cb_manual_build(cb: CallbackQuery, bot: Bot):
+    parts = cb.data.split(":")
+    if len(parts) != 3:
+        return await cb.answer("درخواست نامعتبر است.", show_alert=True)
+    order_id, action = int(parts[1]), parts[2]
+
+    async with async_session() as session:
+        order = await session.get(Order, order_id)
+        if not order or order.status != "awaiting_approval":
+            return await cb.answer("این سفارش قبلاً پردازش شده یا وجود ندارد.", show_alert=True)
+
+        now_dt = dt.datetime.now(dt.timezone.utc)
+
+        if action == "done":
+            # ---------- ساخت دستی انجام شد ----------
+            if order.renew_of:
+                return await cb.answer("برای تمدید، از دکمه «✅ تأیید تمدید» استفاده کنید.", show_alert=True)
+
+            order.status = "deployed"
+            order.deployed_at = now_dt
+            order.approved_at = order.approved_at or now_dt
+            if not order.expires_at:
+                order.expires_at = now_dt + dt.timedelta(days=order.duration_days or 30)
+            await session.commit()
+
+            bot_link = f"https://t.me/{order.bot_username.lstrip('@')}" if order.bot_username else "—"
+            try:
+                await bot.send_message(
+                    order.tg_id,
+                    "🎉 <b>ربات شما آماده شد!</b>\n\n"
+                    f"🔗 لینک ربات: {bot_link}\n\n"
+                    "۱) وارد ربات شوید و <b>/start</b> بزنید\n"
+                    "۲) پنل مدیریت ظاهر می‌شود\n\n"
+                    "موفق باشید! 🚀",
+                )
+            except Exception:
+                pass
+
+            summary = (
+                f"✅ <b>سفارش #{order_id} (ساخت دستی) تحویل‌شده علامت خورد.</b>\n"
+                f"🤖 ربات: @{order.bot_username}\n"
+                f"⌛️ انقضا: {order.expires_at.strftime('%Y/%m/%d') if order.expires_at else '—'}"
+            )
+            try:
+                if cb.message.photo:
+                    await cb.message.edit_caption(caption=(cb.message.caption or "") + f"\n\n{summary}", reply_markup=None)
+                else:
+                    await cb.message.edit_text(summary, reply_markup=None)
+            except Exception:
+                pass
+            return await cb.answer("تحویل ثبت شد ✅")
+
+        if action == "refund":
+            # ---------- رد + عودت کامل وجه (ORM — سازگار با MySQL و SQLite) ----------
+            order.status = "rejected"
+            from database.models import User
+            u = await session.get(User, order.tg_id)
+            if u:
+                u.balance = (u.balance or 0) + order.price
+            else:
+                session.add(User(tg_id=order.tg_id, balance=order.price))
+            await session.commit()
+
+            try:
+                await bot.send_message(
+                    order.tg_id,
+                    f"متأسفانه سفارش #{order_id} شما تأیید نشد.\n"
+                    f"💰 مبلغ <b>{fmt_price(order.price)} {config.CURRENCY}</b> به کیف پول شما بازگردانده شد.\n"
+                    f"برای بررسی بیشتر با پشتیبانی ({getattr(config, 'SUPPORT_USERNAME', 'مدیریت')}) در ارتباط باشید."
+                )
+            except Exception:
+                pass
+
+            try:
+                if cb.message.photo:
+                    await cb.message.edit_caption(caption=(cb.message.caption or "") + f"\n\n❌ <b>سفارش #{order_id} رد شد و وجه عودت داده شد</b>", reply_markup=None)
+                else:
+                    await cb.message.edit_text(f"❌ سفارش #{order_id} رد شد؛ {fmt_price(order.price)} {config.CURRENCY} به کیف پول مشتری عودت داده شد.", reply_markup=None)
+            except Exception:
+                pass
+            return await cb.answer("رد شد و وجه عودت داده شد 💰")
+
+    return await cb.answer("عملیات نامعتبر است.", show_alert=True)
+
+
+# ============================================================
+# 🆕 مدیریت ویدیوی آموزشی توکن (نسخه ۳)
+# آپلود/حذف بدون ری‌استارت — از لحظه ذخیره، خودکار همراه متن‌های راهنما ارسال می‌شود
+# ============================================================
+@router.callback_query(F.data == "adm:video")
+async def cb_video_panel(cb: CallbackQuery):
+    from utils import media_store
+
+    await cb.answer()
+    media = await media_store.get_training_video()
+    if media:
+        file_id, mtype = media
+        type_fa = {"video": "🎥 ویدیو", "animation": "🎞 گیف", "document": "📄 فایل"}.get(mtype, mtype)
+        short = (file_id[:24] + "…") if len(file_id) > 24 else file_id
+        status_text = (
+            "🎬 <b>مدیریت ویدیوی آموزشی توکن</b>\n\n"
+            f"✅ وضعیت: <b>فعال</b> ({type_fa})\n"
+            f"🆔 file_id: <code>{short}</code>\n\n"
+            "این ویدیو همراه «متن دکمه پنل‌ها» و «راهنمای دریافت توکن» برای کاربران ارسال می‌شود."
+        )
+    else:
+        status_text = (
+            "🎬 <b>مدیریت ویدیوی آموزشی توکن</b>\n\n"
+            "❌ وضعیت: <b>ویدیویی تنظیم نشده است.</b>\n\n"
+            "متن‌های راهنما در حال حاضر بدون ویدیو ارسال می‌شوند (بدون خطا).\n"
+            "با آپلود ویدیو، از همان لحظه به‌صورت خودکار همراه متن‌ها ارسال خواهد شد. ✅"
+        )
+
+    from bot.keyboards import video_admin_kb
+    try:
+        await cb.message.edit_text(status_text, reply_markup=video_admin_kb(has_video=bool(media)))
+    except Exception:
+        await cb.message.answer(status_text, reply_markup=video_admin_kb(has_video=bool(media)))
+
+
+@router.callback_query(F.data == "adm:videoup")
+async def cb_video_upload(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    await cb.message.answer(
+        "📤 <b>آپلود ویدیوی آموزشی توکن</b>\n\n"
+        "لطفاً ویدیوی آموزشی را همین‌جا بفرستید:\n"
+        "• 🎥 ویدیو (video)\n"
+        "• 🎞 گیف (animation)\n"
+        "• 📄 فایل ویدیویی (document)\n\n"
+        "پس از دریافت، ذخیره می‌شود و از همان لحظه همراه متن‌های راهنما ارسال خواهد شد.\n"
+        "<i>برای لغو /cancel را بفرستید.</i>"
+    )
+    await state.set_state(AdminVideoState.waiting_media)
+
+
+@router.message(AdminVideoState.waiting_media, F.video | F.animation | F.document)
+async def st_video_receive(message: Message, state: FSMContext, bot: Bot):
+    from utils import media_store
+
+    if message.video:
+        file_id, mtype = message.video.file_id, "video"
+    elif message.animation:
+        file_id, mtype = message.animation.file_id, "animation"
+    else:
+        # فقط فایل‌های ویدیویی قبول می‌شوند
+        mime = (message.document.mime_type or "").lower()
+        if not mime.startswith("video/"):
+            return await message.answer(
+                "❌ این فایل ویدیویی نیست.\n"
+                "لطفاً ویدیو را به‌صورت video، گیف یا فایل ویدیویی بفرستید."
+            )
+        file_id, mtype = message.document.file_id, "document"
+
+    ok = await media_store.save_training_video(file_id, mtype)
+    if not ok:
+        return await message.answer("🔴 خطا در ذخیره ویدیو. لطفاً دوباره تلاش کنید.")
+
+    await state.clear()
+    type_fa = {"video": "🎥 ویدیو", "animation": "🎞 گیف", "document": "📄 فایل"}.get(mtype, mtype)
+    await message.answer(
+        f"✅ <b>ویدیوی آموزشی ذخیره شد!</b> ({type_fa})\n\n"
+        "از این لحظه، ویدیو به‌صورت خودکار همراه «متن دکمه پنل‌ها» و «راهنمای دریافت توکن» ارسال می‌شود."
+    )
+
+
+@router.message(AdminVideoState.waiting_media)
+async def st_video_invalid(message: Message):
+    if (message.text or "").startswith("/"):
+        return  # به /cancel اصلی سپرده می‌شود
+    await message.answer(
+        "❌ لطفاً خودِ ویدیو را بفرستید (video / گیف / فایل ویدیویی) — نه متن یا عکس."
+    )
+
+
+@router.callback_query(F.data == "adm:videodel")
+async def cb_video_delete(cb: CallbackQuery, state: FSMContext):
+    from utils import media_store
+
+    await cb.answer()
+    # اگر ادمین وسط آپلود بود، آن را هم لغو کن
+    await state.clear()
+    ok = await media_store.delete_training_video()
+    if ok:
+        await cb.message.edit_text(
+            "🗑 <b>ویدیوی آموزشی حذف شد.</b>\n\n"
+            "متن‌های راهنما از این پس بدون ویدیو ارسال می‌شوند (بدون هیچ خطایی)."
+        )
+    else:
+        await cb.message.edit_text("🔴 خطا در حذف ویدیو.")

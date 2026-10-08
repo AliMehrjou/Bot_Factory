@@ -18,7 +18,6 @@ def render_instance_env(
     fernet_key: str,
     force_join: str = "",
     login_proxy_url: str = "",
-    video_link: str = "",
     pool_size: int = 10,
     max_overflow: int = 20,
     max_accounts_per_proxy: int = 20,
@@ -56,9 +55,6 @@ FERNET_KEY={fernet_key}
 
 # --- جوین اجباری ---
 FORCE_JOIN_CHANNELS={force_join}
-
-# --- لینک ویدیو (از کانفیگ فکتوری) ---
-VIDEO_LINK={video_link}
 
 # --- پروکسی لاگین (fallback اولیه؛ استخر اصلی از جدول proxies همین دیتابیس سینک می‌شود) ---
 LOGIN_PROXY_URL={login_proxy_url}

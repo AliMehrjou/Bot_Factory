@@ -1,9 +1,13 @@
 """
-فلوی سفارش مشتری — ربات فروش
-============================
-/start → انتخاب پلن → توکن ربات (اعتبارسنجی زنده getMe) → API_ID/API_HASH
-→ کانال جوین اجباری (اختیاری) → خلاصه + اطلاعات پرداخت → تصویر رسید
-→ ارجاع به ادمین برای تأیید → (بعد از تأیید) ساخت خودکار + پیام «ربات آماده شد»
+فلوی سفارش مشتری — ربات فروش (نسخه ۳ — سفارش با ساخت دستی پشتیبانی)
+================================================================
+/start → سفارش سندر → انتخاب پلن (فقط با موجودی شارژ‌شده)
+→ توکن ربات (اعتبارسنجی زنده getMe) → API_ID/API_HASH
+→ کانال جوین اجباری (اختیاری) → خلاصه → پرداخت از کیف پول
+→ ارجاع به پشتیبانی برای ساخت دستی ایمیج ربات (به‌جای دیپلوی خودکار)
+
+شارژ حساب فقط از طریق پیوی پشتیبانی انجام می‌شود (صفحه «شارژ حساب» قیمت پلن‌ها
+را نشان می‌دهد و کاربر را به پیوی پشتیبانی هدایت می‌کند).
 """
 import logging
 import time
@@ -13,37 +17,42 @@ from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup
-from sqlalchemy import select, func
-
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message
-from aiogram import Bot
-
+from sqlalchemy import select, func, text
 
 # توجه: تابع mybots_kb باید طبق کدهای قبلی به bot.keyboards اضافه شده باشد.
 from bot.keyboards import (plans_kb, skip_force_join_kb, confirm_summary_kb,
-                           approval_kb, start_menu_kb, mybots_kb)
+                           approval_kb, start_menu_kb, mybots_kb,
+                           not_charged_kb, manual_build_kb)
 from config import config, fmt_price
 from core.orchestrator import validate_bot_token
 from database import async_session
 from database.models import Order
+from utils.media_store import send_training_video
 
 logger = logging.getLogger(__name__)
 router = Router(name="user_order")
 
+
+def _support_url() -> str | None:
+    """آیدی پشتیبانی از .env → لینک مستقیم تلگرام."""
+    u = (config.SUPPORT_USERNAME or "").strip().lstrip("@")
+    return f"https://t.me/{u}" if u else None
+
+
 WELCOME = (
     "🏭 <b>به ربات‌ساز فان سندر خوش آمدید!</b>\n\n"
     "اینجا می‌توانید <b>ربات ارسال انبوه اختصاصی خودتان (سندر)</b> را سفارش دهید.\n"
-    "پس از تأیید پرداخت، ربات شما به‌صورت <b>کاملاً خودکار</b> روی سرور ساخته و "
-    "در کمتر از ۱ دقیقه آماده تحویل می‌شود — بدون هیچ کار فنی از سمت شما. 🚀\n\n"
+    "پس از ثبت سفارش و پرداخت، تیم پشتیبانی ربات شما را در سریع‌ترین زمان ممکن "
+    "آماده کرده و لینک آن را تحویل می‌دهد. 🚀\n\n"
     "از منوی زیر انتخاب کنید:"
 )
 
 ORDER_INTRO = (
     "🛍 <b>سفارش سندر</b>\n\n"
     "✨ یکی از پلن‌های زیر را انتخاب کنید:\n\n"
-    "💰 هر پلن شامل ربات اختصاصی + پشتیبانی کامل در طول اشتراک است."
+    "💰 هر پلن شامل ربات اختصاصی + پشتیبانی کامل در طول اشتراک است.\n\n"
+    "⚠️ برای انتخاب پلن، موجودی حساب شما باید معادل قیمت پلن باشد؛ "
+    "در غیر این صورت ابتدا از بخش «💳 شارژ حساب»، حساب خود را از طریق پشتیبانی شارژ کنید."
 )
 
 WELCOME_HAS_BOTS = "🏭 <b>ربات‌ساز فان سندر</b>\n\n{count} ربات فعال دارید. سفارش جدید ثبت می‌کنید یا وضعیت ربات‌هایتان را می‌بینید؟"
@@ -61,6 +70,37 @@ GUIDE_TOKEN = (
     "(مثلاً: یک ماه) و بعدش دقیقاً همینجا ارسال می‌کنید. ✅\n\n"
     "⚡ و تمام! سندر شما کمتر از چند دقیقه ساخته میشه.\n\n"
     "⚠️ توکن ربات خودتون رو به هیچ وجه با هیچ‌کس به اشتراک نگذارید؛ چون دسترسی کامل پیدا می‌کنه به رباتتون. ⛔️"
+)
+
+# ============================================================
+# 🆕 متن دکمه پنل‌ها (اشتراک‌ها) — متن رسمی کارفرما
+# در صورتی که حساب شارژ بود و کاربر روی دکمه پلن زد، همین متن + ویدیوی آموزشی ارسال می‌شود.
+# (توجه: متن دکمه «📖 راهنمای دریافت توکن» (GUIDE_TOKEN) با این متن فرق دارد و دست‌نخورده است.)
+# ============================================================
+PLAN_TOKEN_GUIDE = (
+    "🤖 <b>راهنمای ساخت ربات و دریافت توکن:</b>\n\n"
+    "1️⃣ در تلگرام به <b>@BotFather</b> پیام بدهید\n\n"
+    "2️⃣ دستور <code>/newbot</code> را بفرستید\n\n"
+    "3️⃣ یک اسم نمایشی بنویسید (مثلاً «ربات ارسال من»)\n\n"
+    "4️⃣ یک یوزرنیم با پسوند bot انتخاب کنید (مثلاً <code>my_sender_bot</code>)\n\n"
+    "5️⃣ BotFather یک توکن شبیه این می‌دهد:\n"
+    "🔑 <code>123456789:AAH4x...Tq0</code>\n\n"
+    "🎥 توی ویدئو آموزشی ارسالی، نحوه گرفتن توکن ربات خودتون آموزش داده شده است.\n\n"
+    "📩 آن توکن را بعد از پرداخت و شارژ موجودی خود، روی دکمه «سفارش سندر» می‌زنید، "
+    "اشتراک خود را انتخاب می‌کنید (مثلاً: یک ماه) و بعدش دقیقاً همینجا ارسال می‌کنید. ✅\n\n"
+    "⚡ و تمام! سندر شما کمتر از چند دقیقه ساخته میشه.\n\n"
+    "⚠️ توکن ربات خودتون رو به هیچ وجه با هیچ‌کس به اشتراک نگذارید؛ "
+    "چون دسترسی کامل پیدا می‌کنه به رباتتون. ⛔️\n\n"
+    "⭕️ لطفا الان همینجا توکن ربات خودتون رو بدون هیچ چیز اضافه ای بفرستید👇👇:"
+)
+
+NOT_ENOUGH_TEXT = (
+    "💳 <b>موجودی حساب شما برای این پلن کافی نیست.</b>\n\n"
+    "📦 پلن انتخابی: <b>{plan_title}</b> ({days} روز)\n"
+    "💰 قیمت پلن: <b>{price} {currency}</b>\n"
+    "💵 موجودی فعلی شما: <b>{balance} {currency}</b>\n\n"
+    "📌 برای شارژ حساب، به پیوی پشتیبانی مراجعه کنید و طبق پلن مورد نظرتان هماهنگ کنید؛\n"
+    "پس از شارژ، دوباره «🛍️ سفارش سندر» را بزنید. 🙏"
 )
 
 GUIDE_API = (
@@ -180,9 +220,12 @@ async def cmd_mybots(message: Message):
 
 
 @router.callback_query(F.data == "ord:guide")
-async def cb_guide(cb: CallbackQuery):
+async def cb_guide(cb: CallbackQuery, bot: Bot):
+    """دکمه «📖 راهنمای دریافت توکن» — متن دست‌نخورده + ویدیوی آموزشی (در صورت تنظیم بودن)."""
     await cb.answer()
     await cb.message.answer(GUIDE_TOKEN)
+    # 🎬 ویدیوی آموزشی — اگر تنظیم نشده باشد بی‌صدا رد می‌شود (بدون هیچ خطایی)
+    await send_training_video(bot, cb.from_user.id)
 
 
 @router.callback_query(F.data == "ord:cancel")
@@ -225,17 +268,40 @@ async def cb_renew(cb: CallbackQuery, state: FSMContext):
 
 
 @router.callback_query(OrderFlow.plan, F.data.startswith("ord:plan:"))
-async def cb_plan(cb: CallbackQuery, state: FSMContext):
+async def cb_plan(cb: CallbackQuery, state: FSMContext, bot: Bot):
     key = cb.data.split(":")[2]
     plan = config.PLANS.get(key)
     if not plan:
         return await cb.answer("پلن نامعتبر است.", show_alert=True)
-        
+
     data = await state.get_data()
     await state.update_data(plan_key=key, plan_title=plan["title"],
                             price=plan["price"], days=plan["days"])
+
+    # ============================================================
+    # 🆕 چک شارژ بودن حساب — پلن فقط با موجودی کافی قابل انتخاب است.
+    # شارژ حساب از قبل و از طریق پیوی پشتیبانی انجام می‌شود.
+    # ============================================================
+    async with async_session() as session:
+        balance = await session.scalar(
+            text("SELECT balance FROM users WHERE tg_id = :uid"), {"uid": cb.from_user.id}
+        ) or 0
+
+    price = int(plan["price"])
+    if balance < price:
+        await cb.answer("⚠️ موجودی حساب شما کافی نیست", show_alert=True)
+        await cb.message.answer(
+            NOT_ENOUGH_TEXT.format(
+                plan_title=plan["title"], days=plan["days"],
+                price=fmt_price(price), currency=config.CURRENCY,
+                balance=fmt_price(balance),
+            ),
+            reply_markup=not_charged_kb(_support_url()),
+        )
+        return  # کاربر در همان وضعیت انتخاب پلن می‌ماند؛ پس از شارژ دوباره تلاش می‌کند
+
     await cb.answer(f"پلن {plan['title']} انتخاب شد ✅")
-    
+
     if data.get("renew_of"):
         async with async_session() as session:
             old_order = await session.get(Order, data["renew_of"])
@@ -248,7 +314,9 @@ async def cb_plan(cb: CallbackQuery, state: FSMContext):
             )
         await _show_summary(cb.message, state)
     else:
-        await cb.message.edit_text(GUIDE_TOKEN)
+        # 🆕 حساب شارژ است → متن رسمی دکمه پنل‌ها + ویدیوی آموزشی (در صورت وجود)
+        await cb.message.edit_text(PLAN_TOKEN_GUIDE)
+        await send_training_video(bot, cb.from_user.id)
         await state.set_state(OrderFlow.bot_token)
 
 
@@ -360,26 +428,22 @@ async def st_force_join(message: Message, state: FSMContext):
 
 
 # ============================================================
-# خلاصه + پرداخت
+# خلاصه + پرداخت از کیف پول
+# (شارژ حساب از قبل توسط پشتیبانی انجام شده؛ مسیر رسید حذف شده است)
 # ============================================================
 async def _show_summary(message: Message, state: FSMContext):
     data = await state.get_data()
     price = data.get('price', 0)
-    
-    from sqlalchemy import text
-    from database import async_session
-    
-    # 🔴 تغییر مهم: استفاده از chat.id به جای from_user.id
+
     tg_id = message.chat.id
-    
+
     # دریافت موجودی کاربر از دیتابیس
     async with async_session() as session:
         balance = await session.scalar(text("SELECT balance FROM users WHERE tg_id = :uid"), {"uid": tg_id}) or 0
-        
-    can_pay_from_wallet = balance >= price
+
     is_renew = bool(data.get("renew_of"))
-    plan_type = "تمدید" if is_renew else "خرید ربات جدید"
-    
+    plan_type = "تمدید اشتراک" if is_renew else "خرید ربات جدید"
+
     text_msg = (
         "🧾 <b>خلاصه سفارش شما:</b>\n\n"
         f"• نوع سفارش: <b>{plan_type}</b>\n"
@@ -387,47 +451,41 @@ async def _show_summary(message: Message, state: FSMContext):
         f"• قیمت کل: <b>{fmt_price(price)} {config.CURRENCY}</b>\n"
         f"• ربات: @{data['bot_username']}\n"
         f"• کانال جوین اجباری: {data['force_join'] or 'ندارد'}\n\n"
+        f"💰 موجودی کیف پول شما: <b>{fmt_price(balance)} {config.CURRENCY}</b>\n"
     )
-    
-    if can_pay_from_wallet:
+
+    if balance >= price:
         text_msg += (
-            f"💰 <b>موجودی کیف پول شما:</b> {fmt_price(balance)} {config.CURRENCY}\n"
-            f"✅ شما اعتبار کافی دارید. با کلیک روی دکمه زیر، مبلغ کسر شده و ربات فوراً ساخته می‌شود."
+            f"✅ شما اعتبار کافی دارید؛ با ثبت سفارش، مبلغ <b>{fmt_price(price)} {config.CURRENCY}</b> "
+            "از کیف پول شما کسر می‌شود.\n\n"
+            "🔧 سفارش شما پس از پرداخت برای <b>تیم پشتیبانی</b> ارسال می‌شود و ربات شما "
+            "توسط پشتیبانی ساخته و تحویل داده خواهد شد."
         )
     else:
         remaining = price - balance
-        if balance > 0:
-            text_msg += f"💰 موجودی فعلی: <b>{fmt_price(balance)} {config.CURRENCY}</b>\n⚠️ <b>کسری موجودی:</b> <b>{fmt_price(remaining)} {config.CURRENCY}</b>\n\n"
-            
-        card = config.PAYMENT_CARD
-        holder = f" به نام {config.PAYMENT_CARD_HOLDER}" if config.PAYMENT_CARD_HOLDER else ""
-        
         text_msg += (
-            "💳 <b>اطلاعات پرداخت:</b>\n"
-            f"<code>{card}</code>{holder}\n\n"
-            f"لطفاً معادل <b>{fmt_price(remaining)} {config.CURRENCY}</b> را واریز کرده و روی تأیید کلیک کنید تا رسید را بفرستید."
+            f"⚠️ کسری موجودی: <b>{fmt_price(remaining)} {config.CURRENCY}</b>\n\n"
+            "📌 برای شارژ حساب، به پیوی پشتیبانی مراجعه کنید و طبق پلن مورد نظرتان هماهنگ کنید؛\n"
+            "پس از شارژ، دوباره «🛍️ سفارش سندر» را بزنید. 🙏"
         )
-        
-    await message.answer(text_msg, reply_markup=confirm_summary_kb(can_pay_from_wallet))
+
+    await message.answer(text_msg, reply_markup=confirm_summary_kb())
     await state.set_state(OrderFlow.receipt)
 
 @router.callback_query(OrderFlow.receipt, F.data == "ord:pay_wallet")
 async def cb_pay_wallet(cb: CallbackQuery, state: FSMContext, bot: Bot):
     # پاسخ فوری به تلگرام برای جلوگیری از گیر کردن دکمه
-    await cb.answer("⏳ در حال پردازش پرداخت و ساخت ربات...")
-    
+    await cb.answer("⏳ در حال پردازش پرداخت و ثبت سفارش...")
+
     try:
         data = await state.get_data()
         price = data.get("price", 0)
-        
-        from sqlalchemy import text, select
-        from database import async_session
-        from database.models import Order
+        is_renew = bool(data.get("renew_of"))
+
         import datetime as dt
-        from config import config
-        
+
         tg_id = cb.from_user.id
-        
+
         async with async_session() as session:
             # ۱. بررسی تکراری نبودن سفارش
             exists = await session.scalar(
@@ -439,16 +497,22 @@ async def cb_pay_wallet(cb: CallbackQuery, state: FSMContext, bot: Bot):
             )
             if exists:
                 return await cb.message.answer("❌ این سفارش قبلاً ثبت شده است.")
-                
+
             # ۲. کسر اتمیک موجودی (رفع race دکمه پرداخت)
             res = await session.execute(
                 text("UPDATE users SET balance = balance - :price WHERE tg_id = :uid AND balance >= :price"),
                 {"price": price, "uid": tg_id},
             )
             if res.rowcount == 0:
-                return await cb.message.answer("❌ موجودی شما کافی نیست!")
-            
-            # ۴. ثبت سفارش تأیید شده
+                return await cb.message.answer(
+                    "❌ موجودی شما کافی نیست!\n\n"
+                    "📌 برای شارژ حساب، به پیوی پشتیبانی مراجعه کنید و طبق پلن مورد نظرتان هماهنگ کنید."
+                )
+
+            # ۳. ثبت سفارش
+            #    MANUAL_BUILD_MODE=true  → «در انتظار ساخت توسط پشتیبانی» (بدون دیپلوی خودکار)
+            #    MANUAL_BUILD_MODE=false → رفتار قدیمی (تأیید‌شده + صف ساخت خودکار)
+            manual_mode = bool(getattr(config, "MANUAL_BUILD_MODE", True))
             order = Order(
                 tg_id=tg_id,
                 tg_username=cb.from_user.username or "",
@@ -464,24 +528,53 @@ async def cb_pay_wallet(cb: CallbackQuery, state: FSMContext, bot: Bot):
                 api_hash=data.get("api_hash", ""),
                 admin_id=tg_id,
                 force_join=data.get("force_join", ""),
-                receipt_file_id="wallet_payment",
-                status="approved",
+                receipt_file_id="wallet_paid",
+                status="awaiting_approval" if manual_mode else "approved",
                 renew_of=data.get("renew_of"),
-                approved_at=dt.datetime.now(dt.timezone.utc)
+                approved_at=dt.datetime.now(dt.timezone.utc) if not manual_mode else None
             )
             session.add(order)
             await session.commit()
             order_id = order.id
 
-        # ۵. پیام موفقیت
-        await cb.message.edit_text(
-            f"✅ <b>پرداخت با موفقیت انجام شد!</b>\n\n"
-            f"مبلغ {fmt_price(price)} {config.CURRENCY} از کیف پول شما کسر گردید.\n"
-            f"🚀 سفارش #{order_id} وارد صف ساخت شد و تا لحظاتی دیگر تحویل شما می‌شود."
-        )
+        # ۴. پیام موفقیت به مشتری
+        if manual_mode:
+            await cb.message.edit_text(
+                "✅ <b>پرداخت با موفقیت انجام شد!</b>\n\n"
+                f"مبلغ <b>{fmt_price(price)} {config.CURRENCY}</b> از کیف پول شما کسر گردید.\n"
+                f"🛎 سفارش <b>#{order_id}</b> ثبت شد و برای <b>تیم پشتیبانی</b> ارسال گردید.\n\n"
+                "⏳ ربات شما به‌زودی توسط پشتیبانی ساخته شده و لینک آن همین‌جا برایتان ارسال می‌شود. 🚀"
+            )
+        else:
+            await cb.message.edit_text(
+                f"✅ <b>پرداخت با موفقیت انجام شد!</b>\n\n"
+                f"مبلغ {fmt_price(price)} {config.CURRENCY} از کیف پول شما کسر گردید.\n"
+                f"🚀 سفارش #{order_id} وارد صف ساخت شد و تا لحظاتی دیگر تحویل شما می‌شود."
+            )
         await state.clear()
-        
-        # ۶. اطلاع به ادمین
+
+        # ۵. اطلاع به ادمین/پشتیبانی
+        mention = f"@{cb.from_user.username}" if cb.from_user.username else (cb.from_user.full_name or str(tg_id))
+        if manual_mode:
+            admin_text = (
+                f"🛎 <b>سفارش جدید #{order_id}</b>"
+                + (" (تمدید اشتراک)" if is_renew else "") + "\n\n"
+                f"👤 مشتری: {mention} (<code>{tg_id}</code>)\n"
+                f"📦 پلن: {data.get('plan_title')} — {fmt_price(price)} {config.CURRENCY}\n"
+                f"🤖 ربات: @{data.get('bot_username')}\n"
+                f"📅 مدت: {data.get('days')} روز\n"
+                f"💳 پرداخت: از کیف پول انجام شد (پرداخت تأییدشده)\n\n"
+                "🔧 این سفارش در <b>حالت ساخت دستی</b> است؛ پس از آماده‌سازی ایمیج توسط پشتیبانی،\n"
+                "وضعیت را با دکمه‌های زیر به‌روزرسانی کنید."
+            )
+            for admin_id in config.ADMIN_IDS:
+                try:
+                    await bot.send_message(admin_id, admin_text,
+                                           reply_markup=manual_build_kb(order_id, is_renew=is_renew))
+                except Exception:
+                    pass
+            return  # ✋ در حالت ساخت دستی، هیچ دیپلوی خودکاری انجام نمی‌شود
+
         admin_text = (
             f"🟢 <b>فروش خودکار #{order_id} (کیف پول)</b>\n\n"
             f"👤 کاربر: <code>{cb.from_user.id}</code>\n"
@@ -490,11 +583,14 @@ async def cb_pay_wallet(cb: CallbackQuery, state: FSMContext, bot: Bot):
             "این سفارش به‌صورت خودکار پرداخت و دیپلوی شد."
         )
         for admin_id in config.ADMIN_IDS:
-            try: await bot.send_message(admin_id, admin_text)
-            except: pass
-                
-        # ۷. ارسال به صف ساخت
+            try:
+                await bot.send_message(admin_id, admin_text)
+            except Exception:
+                pass
+
+        # ۶. ارسال به صف ساخت (فقط حالت خودکار)
         from core.deploy_queue import DeployJob, deploy_queue
+
         async def notify(result: dict):
             if result.get("ok"):
                 text_msg = (
@@ -502,136 +598,44 @@ async def cb_pay_wallet(cb: CallbackQuery, state: FSMContext, bot: Bot):
                     f"🔗 لینک ربات: {result.get('url', f'https://t.me/' + data.get('bot_username'))}\n\n"
                     "وارد ربات شوید و <b>/start</b> بزنید."
                 )
-                try: await bot.send_message(tg_id, text_msg)
-                except: pass
+                try:
+                    await bot.send_message(tg_id, text_msg)
+                except Exception:
+                    pass
             else:
                 # عودت وجه
                 async with async_session() as session2:
                     await session2.execute(
-                        text("UPDATE users SET balance = balance + :price WHERE tg_id = :uid"), 
+                        text("UPDATE users SET balance = balance + :price WHERE tg_id = :uid"),
                         {"price": price, "uid": tg_id}
                     )
                     await session2.commit()
-                    
+
                 text_msg = "⚠️ متأسفانه در ساخت ربات خطای سرور رخ داد. مبلغ کسر شده به کیف پول شما بازگردانده شد."
-                try: await bot.send_message(tg_id, text_msg)
-                except: pass
-                
+                try:
+                    await bot.send_message(tg_id, text_msg)
+                except Exception:
+                    pass
+
                 import html
                 safe_error = html.escape(str(result.get('error', ''))[:600])
                 for admin_id in config.ADMIN_IDS:
-                    try: await bot.send_message(admin_id, f"🔴 <b>خطا در دیپلوی خودکار #{order_id}:</b>\n<code>{safe_error}</code>")
-                    except: pass
-                    
+                    try:
+                        await bot.send_message(admin_id, f"🔴 <b>خطا در دیپلوی خودکار #{order_id}:</b>\n<code>{safe_error}</code>")
+                    except Exception:
+                        pass
+
         deploy_queue.submit(DeployJob(action="provision", order_id=order_id, done_cb=notify))
-        
+
     except Exception as e:
         # اگر خطایی رخ دهد، اینجا به شما در ربات پیام می‌دهد تا متوجه باگ شویم
         await cb.message.answer(f"🔴 خطای سیستم در هنگام پردازش:\n<code>{str(e)}</code>")
 
-@router.callback_query(OrderFlow.receipt, F.data == "ord:confirm")
-async def cb_confirm(cb: CallbackQuery, state: FSMContext):
-    await cb.answer()
-    data = await state.get_data()
-    await cb.message.edit_text(
-        "💳 <b>لطفاً تصویر رسید واریز را همینجا بفرستید.</b>\n"
-        "(عکس یا فایل — بعد از بررسی توسط ادمین، ربات شما به‌صورت خودکار ساخته می‌شود)"
-    )
-
-
 # ============================================================
-# مرحله ۵: رسید پرداخت → ثبت سفارش + اطلاع ادمین
+# 🆕 نسخه ۳ — فلوی «ارسال رسید» حذف شد:
+# شارژ حساب فقط از طریق پیوی پشتیبانی انجام می‌شود و پلن‌ها فقط با موجودی
+# کافی قابل انتخاب‌اند؛ بنابراین تنها مسیر پرداخت، کیف پول است (ord:pay_wallet).
 # ============================================================
-@router.message(OrderFlow.receipt, F.photo | F.document)
-async def st_receipt(message: Message, state: FSMContext, bot: Bot):
-    data = await state.get_data()
-    file_id = ""
-    if message.photo:
-        file_id = message.photo[-1].file_id
-    elif message.document:
-        file_id = message.document.file_id
-
-    from sqlalchemy import text
-    from database import async_session
-    tg_id = message.chat.id
-
-    async with async_session() as session:
-        # دریافت موجودی لحظه‌ای کاربر
-        balance = await session.scalar(text("SELECT balance FROM users WHERE tg_id = :uid"), {"uid": tg_id}) or 0
-        
-        exists = await session.scalar(
-            select(Order).where(
-                Order.tg_id == tg_id,
-                Order.bot_token == data.get("bot_token", ""),
-                Order.status == "awaiting_approval"
-            )
-        )
-        if exists:
-            return await message.answer("❌ شما هم‌اکنون یک سفارش در انتظار بررسی برای این ربات دارید.")
-
-        price = data.get("price", 0)
-        order = Order(
-            tg_id=tg_id,
-            tg_username=message.from_user.username or "",
-            tg_name=message.from_user.full_name or "",
-            plan_key=data.get("plan_key", ""),
-            plan_title=data.get("plan_title", ""),
-            price=price,
-            duration_days=data.get("days", 30),
-            bot_token=data.get("bot_token", ""),
-            bot_username=data.get("bot_username", ""),
-            bot_title=data.get("bot_title", ""),
-            api_id=data.get("api_id", 0),
-            api_hash=data.get("api_hash", ""),
-            admin_id=tg_id,
-            force_join=data.get("force_join", ""),
-            receipt_file_id=file_id,
-            status="awaiting_approval",
-            renew_of=data.get("renew_of")
-        )
-        session.add(order)
-        await session.commit()
-        order_id = order.id
-
-    import html
-    mention = f"@{message.from_user.username}" if message.from_user.username else message.from_user.full_name
-    mention = html.escape(mention)
-    is_renew_text = f" (تمدید برای ربات {data.get('renew_of')})" if data.get('renew_of') else ""
-    
-    # محاسبه مبلغی که کاربر واقعاً باید واریز کرده باشد
-    remaining = price - balance if price > balance else 0
-    
-    admin_text = (
-        f"🛎 <b>سفارش جدید #{order_id}</b>{is_renew_text}\n\n"
-        f"👤 مشتری: {mention} (<code>{message.from_user.id}</code>)\n"
-        f"📦 پلن: {data.get('plan_title')} — قیمت کل: {fmt_price(price)} {config.CURRENCY}\n"
-        f"💰 موجودی کیف پول: <b>{fmt_price(balance)} {config.CURRENCY}</b>\n"
-        f"💳 مبلغ مورد نیاز رسید: <b>{fmt_price(remaining)} {config.CURRENCY}</b>\n"
-        f"🤖 ربات: @{data.get('bot_username')}\n"
-        f"📅 مدت: {data.get('days')} روز\n\n"
-        "💡 پس از تأیید، پردازش به‌‌صورت خودکار انجام می‌شود."
-    )
-    
-    for admin_id in config.ADMIN_IDS:
-        try:
-            if file_id:
-                await bot.send_photo(admin_id, file_id, caption=admin_text, reply_markup=approval_kb(order_id))
-            else:
-                await bot.send_message(admin_id, admin_text, reply_markup=approval_kb(order_id))
-        except Exception:
-            pass
-
-    await message.answer(
-        "✅ <b>سفارش شما ثبت شد (شماره "
-        f"#{order_id}).</b>\n\n"
-        "پس از تأیید پرداخت توسط پشتیبانی، پردازش انجام شده و "
-        "نتیجه همینجا برایتان ارسال خواهد شد. 🚀"
-    )
-    await state.clear()
-
-@router.message(OrderFlow.receipt)
-async def st_receipt_invalid(message: Message):
-    await message.answer("لطفاً <b>تصویر رسید</b> را بفرستید (عکس/فایل). متن نیست.")
 
 
 # ============================================================

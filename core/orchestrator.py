@@ -368,7 +368,6 @@ async def provision(order: Order) -> dict:
             fernet_key=fernet_key,
             force_join=order.force_join or "",
             login_proxy_url=login_proxy_url,
-            video_link=config.VIDEO_LINK,
             pool_size=pool_size,
             max_overflow=max_overflow,
         )
@@ -413,6 +412,15 @@ async def provision(order: Order) -> dict:
             await session.commit()
 
         from core.proxy_manager import sync_instance
+        # 🎯 تخصیص خودکار پروکسی لاگین + سندر به اینستنس تازه‌ساخته (کارفرما:
+        #    کاربر نهایی هیچ دخالتی ندارد — همه‌چیز از ربات‌ساز مدیریت می‌شود)
+        try:
+            from core.instance_proxies import auto_assign_for_new_instance
+            assign_result = await auto_assign_for_new_instance(order_id)
+            logger.info("🎯 تخصیص خودکار bot_%s: %s", order_id, assign_result)
+        except Exception as e:
+            logger.warning("تخصیص خودکار پروکسی bot_%s ناموفق: %s", order_id, e)
+
         task = asyncio.create_task(sync_instance(order_id, timeout=300))
         _bg_tasks.add(task)
         task.add_done_callback(_bg_tasks.discard)
@@ -499,6 +507,13 @@ async def destroy(order_id: int, drop_db: bool = True) -> dict:
 
     # ۲-ب) آزادسازی اسلات (فلاش داده‌های ردیس انجام می‌شود)
     await free_redis_slot(order_id)
+
+    # ۲-ج) 🎯 پاکسازی تخصیص‌های پروکسی این اینستنس (جدول instance_proxies)
+    try:
+        from core.instance_proxies import cleanup_instance
+        await cleanup_instance(order_id)
+    except Exception as e:
+        logger.warning("پاکسازی تخصیص پروکسی bot_%s ناموفق: %s", order_id, e)
 
     # ۳) حذف دیتابیس مشتری و کاربر ایزوله
     if drop_db:
