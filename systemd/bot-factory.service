@@ -1,0 +1,19 @@
+[Unit]
+Description=Bot Factory — ربات فروش ربات‌ساز
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__ROOT__
+ExecStart=__ROOT__/venv/bin/python __ROOT__/main.py
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+# امنیت سرویس
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

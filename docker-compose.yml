@@ -1,0 +1,176 @@
+# ==========================================
+# 🏭 Bot Factory — زیرساخت مشترک
+# ==========================================
+# MySQL مشترک (max_connections=1000 — تله شماره ۲) + استخر Redis
+# هر اینستنس مشتری به این سرویس‌ها از طریق شبکه factory_net وصل می‌شود.
+#
+# اجرا:  docker compose -f factory-compose.yml --env-file .env up -d
+#
+# ⚠️ ربات فروش (main.py) روی خود هاست اجرا می‌شود (systemd) و از
+#    127.0.0.1:3306 به MySQL وصل می‌شود؛ پورت‌ها فقط روی loopback باز هستند.
+#
+# 📊 ظرفیت پیش‌فرض (آماده ۵۰ سفارش همزمان):
+#    • Redis: ۴ کانتینر × ۱۵ اسلات = ۶۰ اینستنس
+#    • MySQL: (1000-50)÷(5+10) = ۶۳ اینستنس فعال
+
+services:
+  factory_mysql:
+    image: mysql:8.0
+    container_name: factory_mysql
+    restart: always
+    environment:
+      TZ: UTC
+      MYSQL_DATABASE: ${DB_NAME}
+      MYSQL_USER: ${FACTORY_APP_USER}
+      MYSQL_PASSWORD: ${FACTORY_APP_PASS}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASS}
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    ports:
+      - "127.0.0.1:3306:3306"       # فقط هاست خودمان
+    volumes:
+      - factory_mysql_data:/var/lib/mysql
+      - ./my.cnf:/etc/mysql/conf.d/factory.cnf:ro   # max_connections=1000
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -u root -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    logging:
+      driver: "json-file"
+      options: { max-size: "10m", max-file: "3" }
+    networks:
+      - factory_net
+
+  # ------------------------------------------
+  # استخر Redis — هر کانتینر ۱۵ دیتابیس منطقی (0..14)
+  # ۴ کانتینر = ظرفیت ۶۰ اینستنس (آماده ۵۰ سفارش همزمان).
+  # برای بیشتر: NUM_REDIS را در .env زیاد کنید و کانتینر جدید
+  # (factory_redis_5 و ...) + volume آن را به همین فایل اضافه کنید.
+  # ------------------------------------------
+  factory_redis_1:
+    image: redis:7-alpine
+    container_name: factory_redis_1
+    restart: always
+    environment:
+      - REDIS_PASS=${REDIS_PASS}
+    command: ["sh", "-c", "exec redis-server --requirepass \"$$REDIS_PASS\" --maxmemory 256mb --maxmemory-policy noeviction"]
+    logging:
+      driver: "json-file"
+      options: { max-size: "5m", max-file: "2" }
+    volumes:
+      - factory_redis_1_data:/data
+    networks:
+      - factory_net
+    mem_limit: 300m
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASS\" ping"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  factory_redis_2:
+    image: redis:7-alpine
+    container_name: factory_redis_2
+    restart: always
+    environment:
+      - REDIS_PASS=${REDIS_PASS}
+    command: ["sh", "-c", "exec redis-server --requirepass \"$$REDIS_PASS\" --maxmemory 256mb --maxmemory-policy noeviction"]
+    logging:
+      driver: "json-file"
+      options: { max-size: "5m", max-file: "2" }
+    volumes:
+      - factory_redis_2_data:/data
+    networks:
+      - factory_net
+    mem_limit: 300m
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASS\" ping"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  factory_redis_3:
+    image: redis:7-alpine
+    container_name: factory_redis_3
+    restart: always
+    environment:
+      - REDIS_PASS=${REDIS_PASS}
+    command: ["sh", "-c", "exec redis-server --requirepass \"$$REDIS_PASS\" --maxmemory 256mb --maxmemory-policy noeviction"]
+    logging:
+      driver: "json-file"
+      options: { max-size: "5m", max-file: "2" }
+    volumes:
+      - factory_redis_3_data:/data
+    networks:
+      - factory_net
+    mem_limit: 300m
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASS\" ping"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  factory_redis_4:
+    image: redis:7-alpine
+    container_name: factory_redis_4
+    restart: always
+    environment:
+      - REDIS_PASS=${REDIS_PASS}
+    command: ["sh", "-c", "exec redis-server --requirepass \"$$REDIS_PASS\" --maxmemory 256mb --maxmemory-policy noeviction"]
+    logging:
+      driver: "json-file"
+      options: { max-size: "5m", max-file: "2" }
+    volumes:
+      - factory_redis_4_data:/data
+    networks:
+      - factory_net
+    mem_limit: 300m
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASS\" ping"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  factory_mysql_data:
+    name: factory_mysql_data
+  factory_redis_1_data:
+    name: factory_redis_1_data
+  factory_redis_2_data:
+    name: factory_redis_2_data
+  factory_redis_3_data:
+    name: factory_redis_3_data
+  factory_redis_4_data:
+    name: factory_redis_4_data
+
+networks:
+  factory_net:
+    name: factory_net
+    driver: bridge
+
+# ═══════════════════════════════════════════════════════════════
+# 🔁 حالت کانتینری اختیاری (به‌جای اجرای systemd روی هاست):
+# این بلاک را از حالت کامنت خارج کنید و حذف بلاک ports فایل MySQL را
+# بکنید؛ سپس در .env مقدار DB_HOST=factory_mysql بگذارید.
+# ⚠️ امنیت: docker.sock = دسترسی کامل به هاست؛ فقط همین سرویس!
+# ═══════════════════════════════════════════════════════════════
+#  factory_bot:
+#    build: .
+#    container_name: factory_bot
+#    restart: always
+#    env_file: .env
+#    environment:
+#      - DB_HOST=factory_mysql
+#    depends_on:
+#      factory_mysql:
+#        condition: service_healthy
+#    volumes:
+#      - /var/run/docker.sock:/var/run/docker.sock
+#      - /opt/factory:/opt/factory
+#    networks:
+#      - factory_net
+#    logging:
+#      driver: "json-file"
+#      options: { max-size: "20m", max-file: "5" }
