@@ -1,6 +1,6 @@
 """مدل‌های دیتابیس مرکزی ربات‌ساز"""
 import datetime as dt
-from sqlalchemy import String, Integer, BigInteger, Boolean, DateTime, Text, UniqueConstraint, ForeignKey
+from sqlalchemy import String, Integer, BigInteger, Boolean, DateTime, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -95,36 +95,6 @@ class FactoryProxy(Base):
     added_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
-class InstanceProxy(Base):
-    """
-    🎯 تخصیص پروکسی استخر مرکزی به هر اینستنس (خواسته کارفرما):
-    ادمین از ربات‌ساز برای «هر اینستنس» پروکسی لاگین/سندر اضافه می‌کند،
-    حذف/ویرایش/تست می‌گیرد و مشتری (کاربر نهایی) هیچ دخالی ندارد.
-
-    - یک ردیف = تخصیص یک پروکسی به یک اینستنس با نوع استفاده مشخص
-    - usage_type:  login (فقط لاگین) | sender (فقط سندر/ارسال) | both (هردو)
-    - enabled:     خاموش/روشن کردن تخصیص بدون حذف (per-instance)
-    - منبع حقیقتِ سینک: هر اینستنس فقط پروکسی‌های «تخصیص‌یافته و روشن» خودش را
-      در جدول proxies دیتابیس خودش می‌گیرد (به‌جای چرخش عمومی قدیمی).
-    - اینستنس‌هایی که هنوز هیچ تخصیصی ندارند، در حالت legacy از چرخش عمومی
-      استخر سالم استفاده می‌کنند (سازگاری با قبل از این نسخه).
-    """
-    __tablename__ = "instance_proxies"
-    __table_args__ = (
-        UniqueConstraint("order_id", "proxy_id", name="uq_order_proxy"),
-    )
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    order_id: Mapped[int] = mapped_column(Integer, index=True, nullable=False)
-    proxy_id: Mapped[int] = mapped_column(Integer, index=True, nullable=False)
-
-    usage_type: Mapped[str] = mapped_column(String(10), default="login")  # login | sender | both
-    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
-
-    note: Mapped[str] = mapped_column(String(255), default="")  # یادداشت اختیاری ادمین
-    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_now)
-
-
 class RedisSlot(Base):
     """نقشه اسلات‌های Redis: هر اینستنس یک (کانتینر، db منطقی) منحصربه‌فرد می‌گیرد."""
     __tablename__ = "redis_slots"
@@ -140,16 +110,3 @@ class SyncLog(Base):
     ok: Mapped[bool] = mapped_column(Boolean, default=True)
     detail: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_now)
-
-
-class AppSetting(Base):
-    """
-    ⚙️ تنظیمات پویای ربات (key/value) — بدون نیاز به ری‌استارت:
-    - token_guide_video → فایل‌آیدی ویدیوی آموزشی توکن
-      (آپلود از پنل ادمین؛ از لحظه ذخیره، خودکار همراه متن‌های راهنما ارسال می‌شود)
-    """
-    __tablename__ = "app_settings"
-
-    key: Mapped[str] = mapped_column(String(64), primary_key=True)
-    value: Mapped[str] = mapped_column(Text, default="")
-    updated_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)

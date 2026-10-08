@@ -1,19 +1,15 @@
 """
-پنل مدیریت استخر مرکزی پروکسی — رابط ادمین
-===============================================
-/proxies → منوی استخر مرکزی:
-  ➕ افزودن (چند خطی) | 🗂 پروکسی اینستنس‌ها | ♻️ تست همه | 📋 لیست استخر
-  🧹 حذف مُردها | 📄 خروجی متنی | 🔄 سینک دستی
+پنل مدیریت پروکسی — رابط ادمین
+===============================
+/proxies → منو:
+  ➕ افزودن (چند خطی) | ♻️ تست همه | 📋 بهترین‌ها | 🧹 حذف مُردها
+  📄 خروجی متنی | 🔄 سینک دستی به اینستنس‌ها
 فرمت‌های قابل قبول:
   socks5://user:pass@host:port
   host:port:user:pass
   host:port
-
-🎯 برای مدیریت «تفکیک‌شده هر اینستنس» (لاگین/سندر اختصاصی) از دکمه
-  «🗂 پروکسی اینستنس‌ها» یا لیست اینستنس‌ها (/panel → اینستنس‌ها) استفاده کنید.
 """
 import logging
-import datetime as dt
 
 from aiogram import Router, F, Bot
 from aiogram.filters import Command
@@ -21,13 +17,13 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, CallbackQuery
 
-from bot.keyboards import (proxy_menu_kb, proxy_list_manage_kb, confirm_proxy_del_kb,
-                           confirm_purge_kb, admin_panel_kb, proxy_detail_kb)
+from bot.keyboards import (proxy_menu_kb, proxy_list_manage_kb, confirm_proxy_del_kb, 
+                           confirm_purge_kb, admin_panel_kb)
 from config import config
 from core import proxy_manager
 from database import async_session
-from database.models import FactoryProxy, InstanceProxy, Order
-from sqlalchemy import update, select
+from database.models import FactoryProxy
+from sqlalchemy import update
 
 logger = logging.getLogger(__name__)
 router = Router(name="proxy_panel")
@@ -37,32 +33,24 @@ class AddProxyState(StatesGroup):
     waiting_list = State()
 
 
-class EditProxyState(StatesGroup):
-    waiting_new = State()
-
-
 # ============================================================
 # ورودی اصلی
 # ============================================================
 async def _menu_text() -> str:
     st = await proxy_manager.stats()
     sync = st["sync"]
-    asg = st.get("assigned", {})
     return (
         "🌐 <b>مدیریت پروکسی‌های ربات‌ساز</b>\n\n"
         f"🟢 سالم: <b>{st['active']}</b>  |  🟡 کند: <b>{st['weak']}</b>  |  "
         f"🔴 مُرد: <b>{st['dead']}</b>  |  ⚪ غیرفعال: {st['disabled']}\n"
         f"⏱ میانگین پینگ: {st['avg_ping'] or '—'} ms\n"
         f"🔁 آخرین تست: {st['last_cycle']} (سیکل {st['cycle']}) — هر {config.PROXY_CHECK_INTERVAL}s\n\n"
-        f"🎯 <b>تخصیص‌های اینستنس‌ها:</b> {asg.get('enabled', 0)} تخصیص روشن "
-        f"در {asg.get('instances', 0)} اینستنس از {st['instances']} اینستنس فعال\n\n"
         "🔄 <b>تاریخچه سینک به اینستنس‌ها:</b>\n"
         f"✅ {sync.get('ok', 0)} موفق | ❌ {sync.get('fail', 0)} ناموفق"
         f" | آخرین: {sync.get('last', '—')} | {sync.get('proxies', 0)} پروکسی\n"
         f"📋 <b>آخرین وضعیت اینستنس‌ها:</b>\n{sync.get('details', '')}\n\n"
-        "💡 استخر مرکزی = انبار واحد پروکسی (تست مداوم). برای پروکسی‌های "
-        "«اختصاصی هر اینستنس» (لاگین/سندر) از «🗂 پروکسی اینستنس‌ها» وارد شوید.\n"
-        "اینستنس‌های بدون تخصیص اختصاصی، در حالت legacy از استخر عمومی می‌گیرند."
+        "💡 پروکسی‌های سالم به‌صورت خودکار در <b>بخش لاگین</b> همه اینستنس‌ها "
+        "(جدول proxies با usage_type=login) قرار می‌گیرند."
     )
 
 
@@ -158,19 +146,7 @@ async def cb_check(cb: CallbackQuery):
 async def cb_list(cb: CallbackQuery):
     await cb.answer()
     text, proxies = await proxy_manager.top_list_with_objects(20)
-    # شمارش اینستنس‌های استفاده‌کننده از هر پروکسی
-    async with async_session() as session:
-        rows = (await session.execute(
-            select(InstanceProxy.proxy_id)
-            .where(InstanceProxy.enabled == True)
-        )).all()
-    usage_map = {}
-    for (proxy_id,) in rows:
-        usage_map[int(proxy_id)] = usage_map.get(int(proxy_id), 0) + 1
-    try:
-        await cb.message.edit_text(text, reply_markup=proxy_list_manage_kb(proxies, usage_map))
-    except Exception:
-        await cb.message.answer(text, reply_markup=proxy_list_manage_kb(proxies, usage_map))
+    await cb.message.edit_text(text, reply_markup=proxy_list_manage_kb(proxies))
 
 
 # ============================================================
@@ -262,119 +238,3 @@ async def cb_enable(cb: CallbackQuery):
     await cb.answer("🟢 فعال شد")
     text, proxies = await proxy_manager.top_list_with_objects(20)
     await cb.message.edit_text(text, reply_markup=proxy_list_manage_kb(proxies))
-
-
-# ============================================================
-# 🎯 نمای جزئیات یک پروکسی استخر مرکزی (کلیک روی ردیف)
-# ============================================================
-@router.callback_query(F.data.startswith("px:view:"))
-async def cb_view(cb: CallbackQuery):
-    pid = int(cb.data.split(":")[2])
-    await cb.answer()
-    async with async_session() as session:
-        p = await session.get(FactoryProxy, pid)
-        if not p:
-            return await cb.message.edit_text("❌ پروکسی یافت نشد.", reply_markup=proxy_menu_kb())
-        # اینستنس‌هایی که این پروکسی را تخصیص دارند
-        rows = (await session.execute(
-            select(InstanceProxy, Order)
-            .join(Order, Order.id == InstanceProxy.order_id)
-            .where(InstanceProxy.proxy_id == pid)
-            .order_by(InstanceProxy.order_id)
-        )).all()
-
-    usage_lines = []
-    for ap, o in rows[:15]:
-        t = {"login": "🔑", "sender": "📤", "both": "♻️"}.get(ap.usage_type, "؟")
-        usage_lines.append(f"{t} bot_{o.id} (@{o.bot_username or '—'}){'' if ap.enabled else ' ⏸'}")
-    if len(rows) > 15:
-        usage_lines.append(f"… و {len(rows) - 15} اینستنس دیگر")
-    usage_text = "\n".join(usage_lines) if usage_lines else "— (به هیچ اینستنسی تخصیص نیست)"
-
-    icons = {"active": "🟢 سالم", "weak": "🟡 کند", "dead": "🔴 مرده", "disabled": "⚪ غیرفعال"}
-    text = (
-        f"🔍 <b>جزئیات پروکسی #{p.id}</b> (استخر مرکزی)\n\n"
-        f"🌐 آدرس: <code>{p.scheme}://{p.proxy_string}</code>\n"
-        f"📊 وضعیت: <b>{icons.get(p.status, p.status)}</b> | "
-        f"پینگ: {p.ping_ms if p.ping_ms is not None else '—'}ms\n"
-        f"🕒 آخرین تست: {p.last_checked_at.strftime('%m-%d %H:%M') if p.last_checked_at else '—'} | "
-        f"آخرین سینک: {p.last_synced_at.strftime('%m-%d %H:%M') if p.last_synced_at else '—'}\n\n"
-        f"📦 <b>تخصیص به {len(rows)} اینستنس:</b>\n{usage_text}\n\n"
-        "⚠️ ویرایش/حذف در استخر مرکزی روی همه اینستنس‌های بالا اثر دارد."
-    )
-    try:
-        await cb.message.edit_text(text, reply_markup=proxy_detail_kb(pid, p.status == "disabled"))
-    except Exception:
-        await cb.message.answer(text, reply_markup=proxy_detail_kb(pid, p.status == "disabled"))
-
-
-# ============================================================
-# ⚡ تست تک پروکسی استخر مرکزی
-# ============================================================
-@router.callback_query(F.data.startswith("px:tst:"))
-async def cb_test_one(cb: CallbackQuery):
-    pid = int(cb.data.split(":")[2])
-    await cb.answer("⚡ تست در جریان…")
-    async with async_session() as session:
-        p = await session.get(FactoryProxy, pid)
-    if not p:
-        return await cb.message.answer("❌ پروکسی یافت نشد.")
-    ok, latency = await proxy_manager._check_one(p)
-    new_status = ("weak" if (latency or 0) > config.PROXY_WEAK_MS else "active") if ok else "dead"
-    async with async_session() as session:
-        await session.execute(
-            update(FactoryProxy).where(FactoryProxy.id == pid)
-            .values(status=new_status, ping_ms=latency,
-                    last_checked_at=dt.datetime.now(dt.timezone.utc)))
-        await session.commit()
-    icon = {"active": "🟢", "weak": "🟡", "dead": "🔴"}[new_status]
-    await cb.message.answer(
-        f"⚡ <b>نتیجه تست پروکسی #{pid}</b>\n"
-        f"{icon} <code>{p.scheme}://{p.proxy_string}</code>\n"
-        f"{'✅ موفق — پینگ: ' + str(latency) + 'ms' if ok else '❌ ناموفق (اتصال برقرار نشد)'}\n\n"
-        f"وضعیت استخر به «{new_status}» به‌روز شد.",
-        reply_markup=proxy_detail_kb(pid, False),
-    )
-
-
-# ============================================================
-# ✏️ ویرایش پروکسی استخر مرکزی (FSM — همه اینستنس‌ها)
-# ============================================================
-@router.callback_query(F.data.startswith("px:editask:"))
-async def cb_edit_ask(cb: CallbackQuery, state: FSMContext):
-    pid = int(cb.data.split(":")[2])
-    async with async_session() as session:
-        p = await session.get(FactoryProxy, pid)
-    if not p:
-        await cb.answer("❌ پروکسی یافت نشد", show_alert=True)
-        return
-    await cb.answer()
-    await state.set_state(EditProxyState.waiting_new)
-    await state.update_data(pid=pid)
-    await cb.message.answer(
-        f"✏️ <b>ویرایش پروکسی #{pid} در استخر مرکزی</b>\n\n"
-        f"مقدار فعلی: <code>{p.scheme}://{p.proxy_string}</code>\n\n"
-        "رشته جدید را بفرستید (یک خط):\n"
-        "<code>socks5://user:pass@host:port</code> یا <code>host:port:user:pass</code>\n\n"
-        "⚠️ <b>هشدار:</b> این تغییر روی «همه اینستنس‌هایی که این پروکسی را دارند» "
-        "اعمال می‌شود (رشته قدیمی از همه خارج، جدید جایگزین می‌شود).\n"
-        "برای ویرایش فقط یک اینستنس، از پنل آن اینستنس ویرایش کنید.\n\n"
-        "برای لغو /cancel بزنید."
-    )
-
-
-@router.message(EditProxyState.waiting_new, F.text)
-async def st_edit_apply(message: Message, state: FSMContext):
-    data = await state.get_data()
-    pid = data.get("pid")
-    await state.clear()
-    if pid is None:
-        return await message.answer("❌ نشست منقضی شده؛ دوباره تلاش کنید.")
-    result = await proxy_manager.edit_central_proxy(pid, message.text.strip())
-    await message.answer(result["msg"], reply_markup=proxy_menu_kb())
-
-
-@router.message(EditProxyState.waiting_new)
-async def st_edit_invalid(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer("❌ فقط متن (رشته پروکسی) قابل قبول است. عملیات لغو شد.")
