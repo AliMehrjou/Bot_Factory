@@ -98,6 +98,7 @@ class FactoryConfig:
     # پیشوند نوع اختیاری است:  animation:<file_id>  یا  document:<file_id>  (پیش‌فرض: video)
     TOKEN_GUIDE_VIDEO_FILE_ID: str = os.getenv("TOKEN_GUIDE_VIDEO_FILE_ID", "")
 
+    VIDEO_LINK: str = os.getenv("VIDEO_LINK", "")
     # ---------- 🔧 حالت ساخت دستی ----------
     # true  = سفارش‌های پرداخت‌شده به‌جای دیپلوی خودکار، به پشتیبانی ارجاع می‌شوند
     #         (پشتیبانی ایمیج ربات را می‌سازد و از پنل وضعیت را به‌روز می‌کند)
