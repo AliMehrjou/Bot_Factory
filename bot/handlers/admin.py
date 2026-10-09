@@ -207,10 +207,15 @@ async def cb_approval(cb: CallbackQuery, bot: Bot):
         if order.renew_of:
             old_order = await session.get(Order, order.renew_of)
             if old_order:
-                if not old_order.expires_at or old_order.expires_at < now_dt:
+                # رفع مشکل تایم‌زون برای مقایسه زمان انقضا
+                old_exp = old_order.expires_at
+                if old_exp and old_exp.tzinfo is None:
+                    old_exp = old_exp.replace(tzinfo=dt.timezone.utc)
+
+                if not old_exp or old_exp < now_dt:
                     new_exp = now_dt + dt.timedelta(days=order.duration_days)
                 else:
-                    new_exp = old_order.expires_at + dt.timedelta(days=order.duration_days)
+                    new_exp = old_exp + dt.timedelta(days=order.duration_days)
                 
                 old_order.expires_at = new_exp
                 
