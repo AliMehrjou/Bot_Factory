@@ -336,11 +336,16 @@ async def st_bot_token(message: Message, state: FSMContext):
     if token == config.SALES_BOT_TOKEN:
         return await message.answer("❌ این توکن ربات فروش است!")
         
+    # تعریف متغیرهای جا افتاده
+    data = await state.get_data()
+    tg_id = message.from_user.id
+    is_renew = bool(data.get("renew_of"))
+        
     async with async_session() as session:
         # ۱. بررسی تکراری نبودن سفارش
         query = select(Order).where(
             Order.tg_id == tg_id,
-            Order.bot_token == data.get("bot_token", ""),
+            Order.bot_token == token,  # استفاده از متغیر token به جای data.get
             Order.status.notin_(('rejected', 'failed', 'destroyed'))
         )
         
@@ -350,7 +355,7 @@ async def st_bot_token(message: Message, state: FSMContext):
             
         exists = await session.scalar(query)
         if exists:
-            return await cb.message.answer("❌ این سفارش قبلاً ثبت شده است.")
+            return await message.answer("❌ این سفارش قبلاً ثبت شده است.")  # اصلاح cb به message
             
     checking = await message.answer("🔍 در حال بررسی توکن از تلگرام...")
     result = await validate_bot_token(token)
@@ -368,7 +373,6 @@ async def st_bot_token(message: Message, state: FSMContext):
         "🔑 حالا API_ID را بفرستید (فقط عدد).\n\nاگر نمی‌دانید چیست، همین دستور /api را بزنید."
     )
     await state.set_state(OrderFlow.api_id)
-
 
 @router.message(OrderFlow.api_id, Command("api"))
 async def st_api_guide(message: Message):
@@ -493,13 +497,17 @@ async def cb_pay_wallet(cb: CallbackQuery, state: FSMContext, bot: Bot):
 
         async with async_session() as session:
             # ۱. بررسی تکراری نبودن سفارش
-            exists = await session.scalar(
-                select(Order).where(
-                    Order.tg_id == tg_id,
-                    Order.bot_token == data.get("bot_token", ""),
-                    Order.status.notin_(('rejected', 'failed', 'destroyed'))
-                )
+            query = select(Order).where(
+                Order.tg_id == tg_id,
+                Order.bot_token == data.get("bot_token", ""),
+                Order.status.notin_(('rejected', 'failed', 'destroyed'))
             )
+            
+            # در صورت تمدید، ربات قدیمی را از بررسی تکراری بودن استثنا می‌کنیم
+            if is_renew:
+                query = query.where(Order.id != data.get("renew_of"))
+                
+            exists = await session.scalar(query)
             if exists:
                 return await cb.message.answer("❌ این سفارش قبلاً ثبت شده است.")
 
