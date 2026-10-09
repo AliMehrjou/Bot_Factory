@@ -364,7 +364,7 @@ async def cb_pending(cb: CallbackQuery):
     
     # حذف پیام قبلی برای جلوگیری از خطای ویرایش نوع پیام (عکس به متن یا برعکس)
     await cb.message.delete()
-    if o.receipt_file_id:
+    if o.receipt_file_id and o.receipt_file_id != "wallet_paid":
         await cb.message.answer_photo(o.receipt_file_id, caption=text, reply_markup=kb)
     else:
         await cb.message.answer(text, reply_markup=kb)

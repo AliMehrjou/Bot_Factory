@@ -337,15 +337,20 @@ async def st_bot_token(message: Message, state: FSMContext):
         return await message.answer("❌ این توکن ربات فروش است!")
         
     async with async_session() as session:
-        exists = await session.scalar(
-            select(Order).where(
-                Order.bot_token == token, 
-                # وضعیت destroyed به لیست استثنائات اضافه شد
-                Order.status.notin_(('rejected', 'failed', 'destroyed'))
-            )
+        # ۱. بررسی تکراری نبودن سفارش
+        query = select(Order).where(
+            Order.tg_id == tg_id,
+            Order.bot_token == data.get("bot_token", ""),
+            Order.status.notin_(('rejected', 'failed', 'destroyed'))
         )
+        
+        # در صورت تمدید، ربات فعلی را از بررسی تکراری بودن استثنا کن
+        if is_renew:
+            query = query.where(Order.id != data.get("renew_of"))
+            
+        exists = await session.scalar(query)
         if exists:
-            return await message.answer("❌ این توکن از قبل در یک سفارش فعال ثبت شده است.")
+            return await cb.message.answer("❌ این سفارش قبلاً ثبت شده است.")
             
     checking = await message.answer("🔍 در حال بررسی توکن از تلگرام...")
     result = await validate_bot_token(token)

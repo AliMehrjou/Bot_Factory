@@ -60,6 +60,12 @@ FORCE_JOIN_CHANNELS={force_join}
 # --- پروکسی لاگین (fallback اولیه؛ استخر اصلی از جدول proxies همین دیتابیس سینک می‌شود) ---
 LOGIN_PROXY_URL={login_proxy_url}
 
+# --- ویدیوی آموزشی (دکمه «🎥 تماشای فیلم آموزش» در منوی راهنمای ربات) ---
+# 🩹 FIX: قبلاً این خط در قالب وجود نداشت و VIDEO_LINK هرگز به .env اینستنس‌ها
+# نوشته نمی‌شد ← دکمه راهنما با URL خالی ساخته می‌شد و با خطای BUTTON_URL_INVALID
+# کل منوی راهنما از کار می‌افتاد.
+VIDEO_LINK={video_link}
+
 # --- تیونینگ اتصال (پچ engine.py — تله شماره ۲: جمع کانکشن‌ها) ---
 POOL_SIZE={pool_size}
 MAX_OVERFLOW={max_overflow}

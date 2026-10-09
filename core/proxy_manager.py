@@ -43,6 +43,15 @@ _last_cycle_at = None
 _cycle_count = 0
 _sync_summary = {"ok": 0, "fail": 0, "last": None}
 
+# 🩹 FIX: اعتبارسنجی PROXY_USAGE_TYPE — مقدار نامعتبر (مثلاً «send» به‌جای «sender»)
+# باعث می‌شد پروکسی‌های سینک‌شده در هیچ‌کدام از کوئری‌های لاگین/سندر اینستنس
+# قابل انتخاب نباشند (دیده نمی‌شدند) ولی در پنل حضور داشتند.
+_LEGACY_USAGE_TYPE = (
+    config.PROXY_USAGE_TYPE
+    if config.PROXY_USAGE_TYPE in ("login", "sender", "both")
+    else "login"
+)
+
 
 # ------------------------------------------------------------
 # اتصال به ادمین
@@ -458,7 +467,7 @@ def _desired_for_instance(order_id: int, healthy: list) -> dict:
                 "health_state": "HEALTHY" if p.status == "active" else "WEAK",
                 "is_healthy": 1 if p.status == "active" else 0,
                 "ping_ms": p.ping_ms,
-                "usage_type": config.PROXY_USAGE_TYPE,
+                "usage_type": _LEGACY_USAGE_TYPE,
             }
             for p in healthy
         }
@@ -470,7 +479,7 @@ def _desired_for_instance(order_id: int, healthy: list) -> dict:
             "health_state": "HEALTHY" if p.status == "active" else "WEAK",
             "is_healthy": 1 if p.status == "active" else 0,
             "ping_ms": p.ping_ms,
-            "usage_type": config.PROXY_USAGE_TYPE,
+            "usage_type": _LEGACY_USAGE_TYPE,
         }
         for p in picked
     }
@@ -636,31 +645,34 @@ async def sync_instance_now(order_id: int) -> int:
     🎯 سینک فوری «فقط همین اینستنس» (بدون انتظار برای جدول‌ها):
     پروکسی‌های تخصیص‌یافته روشن و سالم با usage_type خودشان نوشته می‌شود؛
     بقیه ردیف‌های مدیریت‌شده غیرفعال می‌شوند. برای دکمه‌های پنل هر اینستنس.
+    🩹 FIX: زیر _sync_lock اجرا می‌شود — بدون قفل، هم‌زمانی با sync_all_instances
+    باعث می‌شد desired کهنه، ردیف تازه-تخصیص‌یافته را DEAD/غیرفعال کند.
     """
     order_id = int(order_id)
-    async with async_session() as session:
-        rows = (await session.scalars(
-            select(FactoryProxy)
-            .where(FactoryProxy.status.in_(("active", "weak")))
-            .order_by(FactoryProxy.id)
-        )).all()
-        desired = await _resolve_desired(order_id, rows)
+    async with _sync_lock:
+        async with async_session() as session:
+            rows = (await session.scalars(
+                select(FactoryProxy)
+                .where(FactoryProxy.status.in_(("active", "weak")))
+                .order_by(FactoryProxy.id)
+            )).all()
+            desired = await _resolve_desired(order_id, rows)
 
-    try:
-        await _sync_one_instance(order_id, desired)
-        if desired:
-            async with async_session() as update_session:
-                now = datetime.now(timezone.utc)
-                await update_session.execute(
-                    update(FactoryProxy)
-                    .where(FactoryProxy.proxy_string.in_(list(desired.keys())))
-                    .values(last_synced_at=now)
-                )
-                await update_session.commit()
-        return len(desired)
-    except Exception as e:
-        logger.error(f"Error syncing {order_id}: {e}")
-        return -1
+        try:
+            await _sync_one_instance(order_id, desired)
+            if desired:
+                async with async_session() as update_session:
+                    now = datetime.now(timezone.utc)
+                    await update_session.execute(
+                        update(FactoryProxy)
+                        .where(FactoryProxy.proxy_string.in_(list(desired.keys())))
+                        .values(last_synced_at=now)
+                    )
+                    await update_session.commit()
+            return len(desired)
+        except Exception as e:
+            logger.error(f"Error syncing {order_id}: {e}")
+            return -1
 
 
 async def _sync_one_instance(order_id: int, desired: dict) -> None:
@@ -699,22 +711,29 @@ async def _sync_one_instance(order_id: int, desired: dict) -> None:
         )
 
         # ۲) درج/به‌روزرسانی پروکسی‌های سالم (با usage_type مخصوص همین اینستنس)
+        #    🩹 رفع 1364: fail_count و in_use صریحاً با 0 درج می‌شوند؛ چون ستون‌های
+        #    قدیمی proxies در سندربِات DEFAULT سطح دیتابیس ندارند و MySQL 8 با
+        #    STRICT_TRANS_TABLES درج ردیف جدید بدون آن‌ها را رد می‌کند.
+        #    شاخه UPDATE (ردیف موجود) این دو ستون را دست نمی‌زند ← شمارنده‌های
+        #    اینستنس (in_use/fail_count) دقیقاً مثل قبل محفوظ می‌مانند.
         if desired:
             await conn.execute(
                 text(
                     f"INSERT INTO `{db_name}`.`proxies` "
-                    "(proxy_string, is_active, usage_type, is_healthy, health_state, ping_ms, last_checked_at) "
-                    "VALUES (:ps, 1, :ut, :ih, :hs, :pm, NOW()) "
+                    "(proxy_string, is_active, usage_type, is_healthy, health_state, ping_ms, fail_count, in_use, last_checked_at) "
+                    "VALUES (:ps, 1, :ut, :ih, :hs, :pm, 0, 0, NOW()) "
                     "ON DUPLICATE KEY UPDATE "
                     "  is_active=1, "
                     "  usage_type=IF(VALUES(usage_type)='both' OR usage_type='both', 'both', VALUES(usage_type)), "
                     "  is_healthy=VALUES(is_healthy), "
                     "  health_state=VALUES(health_state), ping_ms=VALUES(ping_ms), "
-                    "  last_checked_at=NOW()"
+                    "  last_checked_at=NOW(), "
+                    "  consecutive_failures=IF(health_state='DEAD' AND VALUES(health_state)<>'DEAD', 0, consecutive_failures), "
+                    "  consecutive_successes=IF(health_state='DEAD' AND VALUES(health_state)<>'DEAD', 0, consecutive_successes)"
                 ),
                 [
                     {
-                        "ps": ps, "ut": v.get("usage_type", config.PROXY_USAGE_TYPE),
+                        "ps": ps, "ut": v.get("usage_type", _LEGACY_USAGE_TYPE),
                         "ih": v["is_healthy"], "hs": v["health_state"], "pm": v["ping_ms"],
                     }
                     for ps, v in desired.items()
