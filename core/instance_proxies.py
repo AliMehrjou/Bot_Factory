@@ -32,7 +32,7 @@ from sqlalchemy import select, update, delete, func, text, case
 from config import config
 from database import async_session
 from database.models import FactoryProxy, InstanceProxy, Order
-from utils.proxy_parse import parse_proxies_text, parse_proxy_line, mask_proxy
+from utils.proxy_parse import parse_proxies_text, parse_proxy_line, mask_proxy, instance_db_key
 
 logger = logging.getLogger(__name__)
 
@@ -568,16 +568,19 @@ async def get_assignment(assignment_id: int) -> dict | None:
     ap, fp, order = row
 
     # وضعیت در دیتابیس اینستنس (best-effort — ممکن است جدول هنوز ساخته نشده باشد)
+    # 🩹 FIX (B3): جستجو با کلید واقعی ردیف — پروکسی‌های غیر-socks5 با پیشوند
+    # scheme در جدول اینستنس ذخیره می‌شوند.
     inst_info = None
     try:
         from database.engine import get_shared_app_engine
         eng = get_shared_app_engine()
         db_name = config.db_name_for(ap.order_id)
+        ps_key = instance_db_key(fp.proxy_string, fp.scheme)
         async with eng.connect() as conn:
             res = await conn.execute(text(
                 f"SELECT is_active, usage_type, health_state, ping_ms, in_use, fail_count "
                 f"FROM `{db_name}`.`proxies` WHERE proxy_string = :ps LIMIT 1"
-            ), {"ps": fp.proxy_string})
+            ), {"ps": ps_key})
             r = res.first()
             if r:
                 inst_info = {"is_active": bool(r[0]), "usage_type": r[1],
@@ -647,28 +650,36 @@ async def test_instance_proxies(order_id: int) -> dict:
 
     results = await asyncio.gather(*[guarded(pd) for pd in data], return_exceptions=True)
 
-    # اعمال نتایج روی استخر مرکزی (به‌روزرسانی status/ping بدون قفل کامل سیکل)
-    now = datetime.now(timezone.utc)
+    # 🩹 FIX (B4): نتیجه هر تست از طریق ماشین وضعیت اعمال می‌شود
+    # (apply_manual_check_result) — یک شکستِ لحظه‌ای دیگر پروکسی را فوراً dead
+    # نمی‌کند؛ شمارنده‌های consec همان قواعد check_cycle را دنبال می‌کنند و
+    # اگر تغییر وضعیتِ واقعی رخ داد، سینک پس‌زمینه اجرا می‌شود.
+    from core.proxy_manager import apply_manual_check_result
     lines = [f"⚡ <b>نتیجه تست پروکسی‌های bot_{order_id}:</b>\n"]
     healthy = 0
-    async with async_session() as session:
-        for pd, res in zip(data, results):
-            ok, latency = (False, None) if isinstance(res, Exception) else res
-            if ok:
-                healthy += 1
-                new = "weak" if (latency or 0) > config.PROXY_WEAK_MS else "active"
-            else:
-                new = "dead"
-            await session.execute(
-                update(FactoryProxy).where(FactoryProxy.id == pd["id"])
-                .values(status=new, ping_ms=latency, last_checked_at=now)
-            )
-            icon = {"active": "🟢", "weak": "🟡", "dead": "🔴"}[new]
-            lines.append(f"{icon} <code>{mask_proxy(pd['proxy_string'])}</code>"
-                         f" — {latency if latency is not None else '—'}ms")
-        await session.commit()
+    any_transition = False
+    for pd, res in zip(data, results):
+        ok, latency = (False, None) if isinstance(res, Exception) else res
+        new_status, ping, transitioned = await apply_manual_check_result(pd["id"], ok, latency)
+        any_transition = any_transition or transitioned
+        if ok:
+            healthy += 1
+        icon = {"active": "🟢", "weak": "🟡", "dead": "🔴"}.get(new_status or "dead", "⚪")
+        lines.append(f"{icon} <code>{mask_proxy(pd['proxy_string'])}</code>"
+                     f" — {latency if latency is not None else '—'}ms")
 
     lines.append(f"\n🟢 پاسخ‌گو: {healthy} از {len(data)}")
+
+    if any_transition:
+        lines.append("🔄 تغییر وضعیت واقعی رخ داد؛ سینک اینستنس‌ها در پس‌زمینه در جریان است.")
+        async def _post():
+            try:
+                from core.proxy_manager import sync_all_instances
+                await sync_all_instances("تست دستی ادمین")
+            except Exception:
+                logger.exception("سینک پس از تست دستی گروهی ناموفق")
+        _spawn(_post())
+
     return {"ok": True, "msg": "\n".join(lines), "healthy": healthy, "total": len(data)}
 
 

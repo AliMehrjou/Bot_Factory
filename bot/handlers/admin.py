@@ -389,10 +389,19 @@ def admin_instances_kb(page_orders, current_page: int, total_pages: int) -> Inli
             b.button(text=f"⏸ توقف {o.id}", callback_data=f"inst:stop:{o.id}")
         else:
             b.button(text=f"▶️ روشن {o.id}", callback_data=f"inst:start:{o.id}")
-            
-        b.button(text=f"💥 حذف {o.id}", callback_data=f"inst:destroy:{o.id}")
-        b.button(text=f"🌐 پروکسی {o.id}", callback_data=f"ipx:menu:{o.id}", style="primary")
-        sizes.append(3)  # سه دکمه در یک سطر: کنترل | حذف | پروکسی
+
+        # 🩹 FIX (رُل‌اوت): دکمه به‌روزرسانی با ایمیج جدید (force-recreate) —
+        # قبلاً هیچ راهی از داخل ربات برای اعمال ایمیج ریبیلدشده روی اینستنس
+        # موجود وجود نداشت (تنها راه: حلقه دستی README).
+        if o.status in ("deployed", "stopped", "running"):
+            b.button(text=f"🔄 آپدیت {o.id}", callback_data=f"inst:redeploy:{o.id}")
+            b.button(text=f"💥 حذف {o.id}", callback_data=f"inst:destroy:{o.id}")
+            b.button(text=f"🌐 پروکسی {o.id}", callback_data=f"ipx:menu:{o.id}", style="primary")
+            sizes.append(4)  # چهار دکمه در یک سطر: کنترل | آپدیت | حذف | پروکسی
+        else:
+            b.button(text=f"💥 حذف {o.id}", callback_data=f"inst:destroy:{o.id}")
+            b.button(text=f"🌐 پروکسی {o.id}", callback_data=f"ipx:menu:{o.id}", style="primary")
+            sizes.append(3)  # سه دکمه در یک سطر: کنترل | حذف | پروکسی
         
     nav_buttons = 0
     if current_page > 1:
@@ -405,6 +414,10 @@ def admin_instances_kb(page_orders, current_page: int, total_pages: int) -> Inli
     if nav_buttons > 0:
         sizes.append(nav_buttons)
         
+    # 🚀 رُل‌اوت ایمیج جدید روی همه اینستنس‌های deployed (سریال، از صف دیپلوی)
+    b.button(text="🚀 آپدیت همه با ایمیج جدید", callback_data="inst:rollout:all", style="success")
+    sizes.append(1)
+    
     b.button(text="↩️ بازگشت به پنل", callback_data="adm:panel")
     sizes.append(1)
     
@@ -498,6 +511,60 @@ async def cb_inst_start(cb: CallbackQuery):
     from core.deploy_queue import DeployJob, deploy_queue
     deploy_queue.submit(DeployJob(action="start", order_id=oid))
     await cb.answer(f"bot_{oid} در صف روشن‌شدن قرار گرفت")
+
+
+# ============================================================
+# 🔄 REDEPLOY — به‌روزرسانی یک اینستنس با ایمیج جدید (force-recreate)
+# ============================================================
+@router.callback_query(F.data.startswith("inst:redeploy:"))
+async def cb_inst_redeploy(cb: CallbackQuery):
+    oid = int(cb.data.split(":")[2])
+    from core.deploy_queue import DeployJob, deploy_queue
+
+    async def _done(result: dict):
+        if result.get("ok"):
+            msg = f"✅ <b>bot_{oid}</b> با ایمیج جدید بازسازی شد و استارتاپ کامل شد."
+        else:
+            err = html.escape(str(result.get("error") or "خطای نامشخص")[:400])
+            msg = f"❌ به‌روزرسانی <b>bot_{oid}</b> ناموفق:\n<code>{err}</code>"
+        try:
+            await cb.message.answer(msg)
+        except Exception:
+            pass
+
+    deploy_queue.submit(DeployJob(action="redeploy", order_id=oid, done_cb=_done))
+    await cb.answer(f"🔄 bot_{oid} در صف به‌روزرسانی (recreate) قرار گرفت")
+
+
+# ============================================================
+# 🚀 ROLLOUT — به‌روزرسانی همه اینستنس‌های deployed با ایمیج جدید
+# ============================================================
+@router.callback_query(F.data == "inst:rollout:all")
+async def cb_inst_rollout_all(cb: CallbackQuery):
+    from core.deploy_queue import DeployJob, deploy_queue
+
+    async def _done(result: dict):
+        total = int(result.get("total") or 0)
+        if not total:
+            msg = "هیچ اینستنس deployed‌ای برای رُل‌اوت وجود ندارد."
+        else:
+            lines = [
+                f"🚀 <b>رُل‌اوت ایمیج جدید تمام شد</b>",
+                f"✅ موفق: {result.get('done', 0)} | ❌ ناموفق: {result.get('failed', 0)} | مجموع: {total}",
+                "",
+            ]
+            details = result.get("details") or []
+            lines.extend(details[:40])
+            if len(details) > 40:
+                lines.append(f"… و {len(details) - 40} مورد دیگر")
+            msg = "\n".join(lines)
+        try:
+            await cb.message.answer(msg)
+        except Exception:
+            pass
+
+    deploy_queue.submit(DeployJob(action="rollout_all", order_id=0, done_cb=_done))
+    await cb.answer("🚀 رُل‌اوت همه اینستنس‌ها در صف دیپلوی قرار گرفت (سریال انجام می‌شود)")
 
 
 @router.callback_query(F.data.startswith("inst:destroy:"))

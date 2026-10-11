@@ -8,6 +8,7 @@
 
 # Python
 __pycache__/
+/__pycache__/
 *.py[cod]
 *.egg-info/
 venv/
@@ -25,3 +26,17 @@ Thumbs.db
 *.sql
 *.bak
 *.log
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Environment files
+.env
+*.env
+!.env.example
+
+# Virtual environments
+venv/
+.venv/

@@ -15,6 +15,7 @@
   ⏸/▶️ غیرفعال/فعال (بدون حذف)           🗑 حذف تک/گروهی/مرده‌ها
   📄 خروجی متنی                          🔄 سینک فوری همین اینستنس
 """
+import asyncio
 import logging
 
 from aiogram import Router, F, Bot
@@ -225,22 +226,30 @@ async def cb_test_one(cb: CallbackQuery):
     if not info or info["ap"].order_id != oid:
         return await _safe_edit(cb, "❌ تخصیص یافت نشد.", instance_proxy_menu_kb(oid))
     fp = info["fp"]
-    from core.proxy_manager import _check_one
-    import datetime as dt
+    from core.proxy_manager import _check_one, apply_manual_check_result
     ok, latency = await _check_one(fp)
-    new_status = ("weak" if (latency or 0) > config.PROXY_WEAK_MS else "active") if ok else "dead"
-    async with async_session() as session:
-        await session.execute(
-            update(FactoryProxy).where(FactoryProxy.id == fp.id)
-            .values(status=new_status, ping_ms=latency,
-                    last_checked_at=dt.datetime.now(dt.timezone.utc)))
-        await session.commit()
-    icon = {"active": "🟢", "weak": "🟡", "dead": "🔴"}[new_status]
+    # 🩹 FIX (B4): نتیجه تست از طریق ماشین وضعیت اعمال می‌شود — یک شکستِ
+    # لحظه‌ای دیگر پروکسی را فوراً dead نمی‌کند (قواعد consec مثل check_cycle).
+    new_status, ping, transitioned = await apply_manual_check_result(fp.id, ok, latency)
+    icon = {"active": "🟢", "weak": "🟡", "dead": "🔴"}.get(new_status or "dead", "⚪")
+    note = ""
+    if ok and new_status == "dead":
+        note = (f"\nℹ️ برای بازیابی کامل از DEAD، {config.PROXY_RECOVER_OKS} موفقیت پیاپی "
+                f"(تست یا سیکل بعدی) لازم است.")
+    if transitioned:
+        note += "\n🔄 تغییر وضعیت واقعی رخ داد؛ سینک پس‌زمینه در جریان است."
+        async def _post():
+            try:
+                from core.proxy_manager import sync_all_instances
+                await sync_all_instances("تست دستی ادمین")
+            except Exception:
+                logger.exception("سینک پس از تست دستی ناموفق")
+        asyncio.create_task(_post())
     await cb.message.answer(
         f"⚡ <b>نتیجه تست پروکسی #{apid}</b> (bot_{oid})\n"
         f"{icon} <code>{fp.scheme}://{fp.proxy_string}</code>\n"
         f"{'✅ موفق — پینگ: ' + str(latency) + 'ms' if ok else '❌ ناموفق (اتصال برقرار نشد)'}\n\n"
-        f"وضعیت استخر به «{new_status}» به‌روز شد.",
+        f"وضعیت استخر: «{new_status}» (ماشین وضعیت).{note}",
         reply_markup=instance_proxy_detail_kb(oid, apid, info["ap"].enabled),
     )
 

@@ -27,8 +27,8 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class DeployJob:
-    action: str                      # provision | destroy | stop | start
-    order_id: int
+    action: str                      # provision | destroy | stop | start | redeploy | rollout_all
+    order_id: int                    # برای rollout_all مقدار 0 است (همه اینستنس‌ها)
     chat_id: Optional[int] = None    # چت مشتری برای اطلاع نتیجه
     done_cb: Optional[Callable[[dict], Awaitable[None]]] = None
     context: dict = field(default_factory=dict)
@@ -136,6 +136,34 @@ class DeployQueue:
                                       {"s": real_status, "o": job.order_id})
                 await session.commit()
             return {"ok": real_status == 'deployed'}
+
+        # 🩹 FIX (رُل‌اوت): اعمال ایمیج جدید روی یک اینستنس موجود — قبلاً هیچ
+        # مسیری (نه پنل، نه صف) کانتینر در حال اجرا را Recreate نمی‌کرد و تنها
+        # راه، حلقه دستی force-recreate در README بود.
+        if job.action == "redeploy":
+            result = await orchestrator.redeploy(job.order_id)
+            # همگام‌سازی وضعیت سفارش با واقعیت کانتینر (اگر recreate شکست خورد
+            # و کانتینر خاموش ماند، ادمین بتواند از پنل start بزند)
+            real_status = 'deployed'
+            try:
+                st = await orchestrator.status(job.order_id)
+                real_status = 'deployed' if st.get("running") else 'stopped'
+                async with async_session() as session:
+                    await session.execute(
+                        text("UPDATE orders SET status=:s WHERE id=:o AND status IN ('deployed','stopped')"),
+                        {"s": real_status, "o": job.order_id})
+                    await session.commit()
+            except Exception:
+                logger.exception("به‌روزرسانی وضعیت سفارش پس از redeploy ناموفق")
+            if result.get("ok") and real_status != 'deployed':
+                result = {"ok": False, "container": result.get("container", f"bot_{job.order_id}"),
+                          "error": "کانتینر بعد از بازسازی در حال اجرا نیست."}
+            return result
+
+        # 🚀 رُل‌اوت ایمیج جدید روی همه اینستنس‌های deployed (سریال، از همین صف —
+        # تا با provision های موازی رقابت نکند و CPU/دیتابیس اسپایک نزند)
+        if job.action == "rollout_all":
+            return await orchestrator.rollout_all()
 
         return {"ok": False, "error": f"action نامعتبر: {job.action}"}
 

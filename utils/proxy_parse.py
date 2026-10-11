@@ -136,3 +136,28 @@ def mask_proxy(proxy_string: str) -> str:
         user = creds.split(":", 1)[0] if ":" in creds else creds
         return f"{user}:***@{hostport}"
     return proxy_string
+
+
+def instance_db_key(raw: str, scheme: str) -> str:
+    """
+    🩹 FIX (B3): کلید ردیف پروکسی در جدول proxies دیتابیس «اینستنس‌ها».
+    • socks5 → همان رشته خام (سازگاری کامل با داده‌ها/بایندهای قدیمی)
+    • scheme های دیگر (http/socks4/…) → رشته با پیشوند scheme تا سمت سندربات
+      پروتکل درست را تشخیص دهد (پارس socks5 هاردکد قبلی، اتصال را fail می‌کرد)
+    """
+    if scheme and scheme != "socks5":
+        return f"{scheme}://{raw}"
+    return raw
+
+
+def all_instance_db_forms(raw: str, scheme: str) -> list:
+    """
+    همه فرمت‌های ممکنِ همان پروکسی در جدول proxies اینستنس‌ها:
+    فرم خام (ردیف‌های legacy) + فرم دارای پیشوند (فرم جدید).
+    برای غیرفعال‌سازی/پاکسازی بعد از حذف یا ویرایش پروکسی مرکزی.
+    """
+    forms = [raw]
+    key = instance_db_key(raw, scheme)
+    if key != raw:
+        forms.append(key)
+    return forms

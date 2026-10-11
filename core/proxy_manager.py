@@ -32,7 +32,7 @@ from config import config
 from database import async_session
 from database.engine import get_shared_app_engine, drop_instance_engine
 from database.models import FactoryProxy, InstanceProxy, Order, SyncLog
-from utils.proxy_parse import ParsedProxy, parse_proxies_text, mask_proxy
+from utils.proxy_parse import ParsedProxy, parse_proxies_text, mask_proxy, instance_db_key, all_instance_db_forms
 
 logger = logging.getLogger(__name__)
 
@@ -46,10 +46,13 @@ _sync_summary = {"ok": 0, "fail": 0, "last": None}
 # 🩹 FIX: اعتبارسنجی PROXY_USAGE_TYPE — مقدار نامعتبر (مثلاً «send» به‌جای «sender»)
 # باعث می‌شد پروکسی‌های سینک‌شده در هیچ‌کدام از کوئری‌های لاگین/سندر اینستنس
 # قابل انتخاب نباشند (دیده نمی‌شدند) ولی در پنل حضور داشتند.
+# 🩹 FIX (B2): fallback پیش‌فرض به «both» تغییر کرد — با «login» اینستنس‌های
+# legacy (بدون تخصیص اختصاصی) هیچ پروکسی سندری دریافت نمی‌کردند چون
+# claim سندر فقط ('sender','both') می‌خواند؛ «both» برای هر دو مسیر کار می‌کند.
 _LEGACY_USAGE_TYPE = (
     config.PROXY_USAGE_TYPE
     if config.PROXY_USAGE_TYPE in ("login", "sender", "both")
-    else "login"
+    else "both"
 )
 
 
@@ -110,18 +113,26 @@ async def add_proxies_from_text(text: str) -> dict:
 _bg_tasks = set()
 
 
-async def _deactivate_in_all_instances(proxy_strings: list) -> int:
+async def _deactivate_in_all_instances(items: list) -> int:
     """
     🛠 رفع باگ مهم نسخه قبل: وقتی پروکسی از استخر مرکزی حذف می‌شد، ردیف فعالش
     در دیتابیس اینستنس‌ها باقی می‌ماند (چون دیگر member «known_to_factory» نبود و
     سینک آن را deactive نمی‌کرد). حالا قبل از حذف، رشته در «همه» دیتابیس‌های
     اینستنس‌های فعال/متوقف غیرفعال می‌شود تا لاگین/سندر روی آن ننشیند.
+    🩹 FIX (B3): items = [(proxy_string, scheme), ...] — هر دو فرم خام (legacy)
+    و دارای پیشوندِ scheme غیرفعال می‌شوند تا ردیف‌های با فرمت جدید هم قطع شوند.
     """
-    if not proxy_strings:
+    if not items:
         return 0
     from sqlalchemy import text as _text, bindparam
     from database.engine import get_shared_app_engine
     eng = get_shared_app_engine()
+
+    forms = []
+    for raw, scheme in items:
+        forms.extend(all_instance_db_forms(raw, scheme))
+    if not forms:
+        return 0
 
     async with async_session() as session:
         orders = (await session.scalars(
@@ -139,11 +150,11 @@ async def _deactivate_in_all_instances(proxy_strings: list) -> int:
                         "SET is_active=0, is_healthy=0, health_state='DEAD' "
                         "WHERE proxy_string IN :ps"
                     ).bindparams(bindparam("ps", expanding=True)),
-                    {"ps": list(proxy_strings)},
+                    {"ps": list(forms)},
                 )
             done += 1
         except Exception as e:
-            logger.debug("غیرفعال‌سازی %s در %s ناموفق: %s", proxy_strings[:2], db_name, e)
+            logger.debug("غیرفعال‌سازی %s در %s ناموفق: %s", forms[:2], db_name, e)
     return done
 
 
@@ -157,6 +168,7 @@ async def remove_proxy(proxy_id: int) -> bool:
         if not p:
             return False
         proxy_string = p.proxy_string
+        proxy_scheme = p.scheme
         # ۱) حذف تخصیص‌های این پروکسی از همه اینستنس‌ها
         await session.execute(
             delete(InstanceProxy).where(InstanceProxy.proxy_id == int(proxy_id)))
@@ -164,7 +176,7 @@ async def remove_proxy(proxy_id: int) -> bool:
         await session.commit()
 
     # ۲) غیرفعال‌سازی در دیتابیس همه اینستنس‌های زنده
-    n = await _deactivate_in_all_instances([proxy_string])
+    n = await _deactivate_in_all_instances([(proxy_string, proxy_scheme)])
     logger.info("🗑 پروکسی %s حذف شد (در %s دیتابیس اینستنس غیرفعال گردید)",
                 mask_proxy(proxy_string), n)
     return True
@@ -173,23 +185,22 @@ async def remove_proxy(proxy_id: int) -> bool:
 async def purge_dead() -> int:
     """حذف کامل پروکسی‌های مرده از فکتوری + غیرفعال‌سازی ردیف‌هایشان در اینستنس‌ها."""
     async with async_session() as session:
-        dead_strings = set((await session.scalars(
-            select(FactoryProxy.proxy_string).where(FactoryProxy.status == "dead")
-        )).all())
-        dead_ids = set((await session.scalars(
-            select(FactoryProxy.id).where(FactoryProxy.status == "dead")
-        )).all())
+        dead_rows = (await session.scalars(
+            select(FactoryProxy).where(FactoryProxy.status == "dead")
+        )).all()
+        dead_ids = [p.id for p in dead_rows]
         if not dead_ids:
             return 0
+        dead_items = [(p.proxy_string, p.scheme) for p in dead_rows]
         await session.execute(
             delete(InstanceProxy).where(InstanceProxy.proxy_id.in_(dead_ids)))
         res = await session.execute(
-            delete(FactoryProxy).where(FactoryProxy.status == "dead"))
+            delete(FactoryProxy).where(FactoryProxy.id.in_(dead_ids)))
         await session.commit()
         n = res.rowcount or 0
 
-    if dead_strings:
-        await _deactivate_in_all_instances(list(dead_strings))
+    if dead_items:
+        await _deactivate_in_all_instances(dead_items)
     return n
 
 
@@ -224,6 +235,7 @@ async def edit_central_proxy(proxy_id: int, new_raw: str) -> dict:
         if not old:
             return {"ok": False, "msg": "پروکسی یافت نشد."}
         old_string = old.proxy_string
+        old_scheme = old.scheme
         if old_string == p.proxy_string:
             return {"ok": False, "msg": "ℹ️ رشته جدید با مقدار فعلی یکسان است."}
 
@@ -273,7 +285,7 @@ async def edit_central_proxy(proxy_id: int, new_raw: str) -> dict:
             await session.commit()
 
     # رشته قدیمی را در همه دیتابیس‌های اینستنس غیرفعال کن (جایگزین شده است)
-    await _deactivate_in_all_instances([old_string])
+    await _deactivate_in_all_instances([(old_string, old_scheme)])
 
     t = asyncio.create_task(check_cycle(force=True))
     _bg_tasks.add(t)
@@ -305,6 +317,40 @@ async def _check_one(p: FactoryProxy) -> tuple:
         return True, latency
     except Exception:
         return False, None
+
+
+async def apply_manual_check_result(proxy_id: int, ok: bool, latency) -> tuple:
+    """
+    🩹 FIX (B4): اعمال نتیجه تستِ «دستی» ادمین با احترام به ماشین وضعیت.
+    قبلاً تست پنل نتیجه یک اتصال را مستقیم روی FactoryProxy.status می‌نوشت؛
+    یعنی یک timeout لحظه‌ای (شلوغی شبکه) پروکسی را فوراً «dead» می‌کرد و
+    همان پروکسی در همه اینستنس‌ها غیرفعال می‌شد — تستِ تشخیصی عملاً «قطع‌کن» بود.
+    حالا شمارنده‌ها همان قواعد check_cycle را دنبال می‌کنند:
+      • موفقیت  → consec_ok+1 / consec_fail=0 (بازیابی از dead پس از PROXY_RECOVER_OKS موفقیت پیاپی)
+      • شکست    → consec_fail+1 / consec_ok=0 (dead فقط پس از PROXY_DEAD_FAILS شکست پیاپی)
+    خروجی: (new_status, ping_ms, transitioned) — transitioned=True اگر وضعیت عوض شد.
+    """
+    async with async_session() as session:
+        p = await session.get(FactoryProxy, int(proxy_id))
+        if not p:
+            return None, None, False
+        old = p.status
+        if ok:
+            new = "weak" if (latency or 0) > config.PROXY_WEAK_MS else "active"
+            if old == "dead" and (int(p.consec_ok or 0) + 1) < config.PROXY_RECOVER_OKS:
+                new = "dead"
+            p.consec_ok = int(p.consec_ok or 0) + 1
+            p.consec_fail = 0
+        else:
+            latency = None
+            p.consec_ok = 0
+            p.consec_fail = int(p.consec_fail or 0) + 1
+            new = "dead" if p.consec_fail >= config.PROXY_DEAD_FAILS else old
+        p.status = new
+        p.ping_ms = latency
+        p.last_checked_at = datetime.now(timezone.utc)
+        await session.commit()
+    return new, latency, (new != old)
 
 
 # ------------------------------------------------------------
@@ -467,6 +513,7 @@ def _desired_for_instance(order_id: int, healthy: list) -> dict:
                 "health_state": "HEALTHY" if p.status == "active" else "WEAK",
                 "is_healthy": 1 if p.status == "active" else 0,
                 "ping_ms": p.ping_ms,
+                "scheme": p.scheme,
                 "usage_type": _LEGACY_USAGE_TYPE,
             }
             for p in healthy
@@ -479,6 +526,7 @@ def _desired_for_instance(order_id: int, healthy: list) -> dict:
             "health_state": "HEALTHY" if p.status == "active" else "WEAK",
             "is_healthy": 1 if p.status == "active" else 0,
             "ping_ms": p.ping_ms,
+            "scheme": p.scheme,
             "usage_type": _LEGACY_USAGE_TYPE,
         }
         for p in picked
@@ -498,7 +546,8 @@ def _desired_from_assignments(rows: list) -> dict:
             "health_state": "HEALTHY" if fp.status == "active" else "WEAK",
             "is_healthy": 1 if fp.status == "active" else 0,
             "ping_ms": fp.ping_ms,
-            "usage_type": ap.usage_type if ap.usage_type in ("login", "sender", "both") else config.PROXY_USAGE_TYPE,
+            "scheme": fp.scheme,
+            "usage_type": ap.usage_type if ap.usage_type in ("login", "sender", "both") else _LEGACY_USAGE_TYPE,
         }
     return desired
 
@@ -619,9 +668,17 @@ async def sync_instance(order_id: int, timeout: int = 120) -> None:
     from core.orchestrator import status
 
     while time.monotonic() < deadline:
-        container_status = await status(order_id)
-        if container_status != "running":
-            logger.warning(f"کانتینر bot_{order_id} در وضعیت running نیست (وضعیت: {container_status}). انتظار برای سینک لغو شد.")
+        # 🩹 FIX (B1): status() یک دیکشنری برمی‌گرداند؛ مقایسه dict != "running"
+        # همیشه True بود و تابع در همان دور اول return می‌کرد — مسیر سینکِ پس از
+        # provision عملاً کد مرده بود و پروکسی‌ها فقط به شانس سیکل ۱۸۰ثانیه‌ای
+        # check_cycle می‌رسیدند (فاصله ۳ تا ۱۵ دقیقه‌ای «ربات ساخته شد تا پروکسی
+        # نشستن»). الگوی صحیح همان st.get("running") است که در deploy_queue هم استفاده می‌شود.
+        st = await status(order_id)
+        if not st.get("running"):
+            logger.warning(
+                f"کانتینر bot_{order_id} در وضعیت running نیست (وضعیت: {st.get('state', 'unknown')}). "
+                f"انتظار برای سینک لغو شد."
+            )
             return
 
         try:
@@ -682,6 +739,15 @@ async def _sync_one_instance(order_id: int, desired: dict) -> None:
         نباشد؛ 'both' (تنظیم دستی مشتری یا تخصیص هردو) همیشه حفظ می‌شود.
       • غیرفعال‌سازی ردیف‌های مدیریت‌شده‌ای که دیگر در desired نیستند
         (مرده / حذف تخصیص / تخصیص خاموش) — پروکسی شخصی مشتری هرگز دست نمی‌خورد.
+    🩹 FIX (B3): کلید ردیف در دیتابیس اینستنس، برای scheme های غیر socks5 با
+      پیشوند scheme نوشته می‌شود (مثلاً http://user:pass@host:port) تا سمت سندربات
+      پروتکل درست تشخیص داده شود. socks5 مثل قبل بدون پیشوند می‌ماند (سازگاری
+      کامل با ردیف‌ها/بایندهای قدیمی). ردیف‌های legacyِ پروکسی‌های غیر-socks5
+      (فرمت خام) در اولین سینک بعدی خودکار غیرفعال و با فرم درست جایگزین می‌شوند.
+    🩹 FIX (B5): ترتیب انتساب‌های ON DUPLICATE KEY UPDATE اصلاح شد —
+      consecutive_* قبل از health_state=VALUES(...) اعمال می‌شوند تا شرط
+      «قبلاً DEAD و جدید غیر-DEAD» مقدار قدیمی health_state را ببیند و
+      شمارنده‌های بازیابی هنگام خروج از DEAD واقعاً صفر شوند.
     """
     db_name = config.db_name_for(order_id)
     from database.engine import get_shared_app_engine
@@ -693,14 +759,26 @@ async def _sync_one_instance(order_id: int, desired: dict) -> None:
     # رشته‌های تحت مدیریت فکتوری برای این اینستنس:
     #   الف) همه پروکسی‌های انبار مرکزی +  ب) رشته‌های تخصیص‌یافته (حتی اگر پروکسی
     #   از انبار حذف شده باشد) — تا هیچ ردیف مدیریتی سرگردان فعلی باقی نماند.
+    #   🩹 (B3) هر دو «فرم خام» و «فرم دارای پیشوند scheme» پوشش داده می‌شوند.
     async with async_session() as session:
-        known_to_factory = set((await session.scalars(select(FactoryProxy.proxy_string))).all())
+        pool_rows = (await session.scalars(select(FactoryProxy))).all()
+        known_to_factory = set()
+        for p in pool_rows:
+            known_to_factory.update(all_instance_db_forms(p.proxy_string, p.scheme))
         assigned = (await session.execute(
-            select(FactoryProxy.proxy_string)
+            select(FactoryProxy)
             .join(InstanceProxy, InstanceProxy.proxy_id == FactoryProxy.id)
             .where(InstanceProxy.order_id == int(order_id))
-        )).all()
-        managed = known_to_factory | {r[0] for r in assigned}
+        )).scalars().all()
+        managed = set(known_to_factory)
+        for p in assigned:
+            managed.update(all_instance_db_forms(p.proxy_string, p.scheme))
+
+    # 🩹 (B3) تبدیل کلیدهای desired به کلید واقعی جدول اینستنس
+    desired_write = {
+        instance_db_key(ps, v.get("scheme") or "socks5"): v
+        for ps, v in desired.items()
+    }
 
     async with eng.begin() as conn:
         # ۱) وضعیت فعلی اینستنس (همه انواع — سندر هم مدیریت می‌شود)
@@ -716,7 +794,7 @@ async def _sync_one_instance(order_id: int, desired: dict) -> None:
         #    STRICT_TRANS_TABLES درج ردیف جدید بدون آن‌ها را رد می‌کند.
         #    شاخه UPDATE (ردیف موجود) این دو ستون را دست نمی‌زند ← شمارنده‌های
         #    اینستنس (in_use/fail_count) دقیقاً مثل قبل محفوظ می‌مانند.
-        if desired:
+        if desired_write:
             await conn.execute(
                 text(
                     f"INSERT INTO `{db_name}`.`proxies` "
@@ -726,17 +804,20 @@ async def _sync_one_instance(order_id: int, desired: dict) -> None:
                     "  is_active=1, "
                     "  usage_type=IF(VALUES(usage_type)='both' OR usage_type='both', 'both', VALUES(usage_type)), "
                     "  is_healthy=VALUES(is_healthy), "
-                    "  health_state=VALUES(health_state), ping_ms=VALUES(ping_ms), "
-                    "  last_checked_at=NOW(), "
+                    # 🩹 (B5) این دو انتساب باید «قبل از» health_state=VALUES(...) بیایند
+                    # تا در شرط، مقدار قدیمی health_state دیده شود (MySQL انتساب‌ها را
+                    # چپ‌به‌راست اعمال می‌کند و ارجاع بعدی مقدار جدید را می‌بیند).
                     "  consecutive_failures=IF(health_state='DEAD' AND VALUES(health_state)<>'DEAD', 0, consecutive_failures), "
-                    "  consecutive_successes=IF(health_state='DEAD' AND VALUES(health_state)<>'DEAD', 0, consecutive_successes)"
+                    "  consecutive_successes=IF(health_state='DEAD' AND VALUES(health_state)<>'DEAD', 0, consecutive_successes), "
+                    "  health_state=VALUES(health_state), ping_ms=VALUES(ping_ms), "
+                    "  last_checked_at=NOW()"
                 ),
                 [
                     {
                         "ps": ps, "ut": v.get("usage_type", _LEGACY_USAGE_TYPE),
                         "ih": v["is_healthy"], "hs": v["health_state"], "pm": v["ping_ms"],
                     }
-                    for ps, v in desired.items()
+                    for ps, v in desired_write.items()
                 ],
             )
 
@@ -744,7 +825,7 @@ async def _sync_one_instance(order_id: int, desired: dict) -> None:
         #    (شرط ps in managed تضمین می‌کند پروکسی شخصی کاربر را دستکاری نکنیم)
         to_disable = [
             ps for ps, act in current.items()
-            if act and ps in managed and ps not in desired
+            if act and ps in managed and ps not in desired_write
         ]
         for ps in to_disable:
             await conn.execute(
@@ -755,7 +836,7 @@ async def _sync_one_instance(order_id: int, desired: dict) -> None:
                 {"ps": ps},
             )
 
-    logger.info("🔄 سینک %s پروکسی به %s (%s غیرفعال شد)", len(desired), db_name, len(to_disable))
+    logger.info("🔄 سینک %s پروکسی به %s (%s غیرفعال شد)", len(desired_write), db_name, len(to_disable))
  
 
 async def drop_engine_for(order_id: int) -> None:

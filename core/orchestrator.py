@@ -475,6 +475,72 @@ async def start(order_id: int) -> None:
     await run_cmd(compose_up_cmd(order_id), timeout=120)
 
 
+# ============================================================
+# 🔄 REDEPLOY / ROLLOUT — اعمال ایمیج جدید روی اینستنس‌های موجود
+# ============================================================
+# چرا لازم است؟ کانتینر در لحظه ساخت به Image ID (نه تگ) قفل می‌شود؛ ریبیلد
+# ایمیج با تگ ثابت فقط اشاره‌گرِ تگ را جابجا می‌کند و کانتینرهای در حال اجرا
+# تا ابد همان کدهای قدیمی را اجرا می‌کنند. تنها راه، Recreate کانتینر است.
+async def redeploy(order_id: int) -> dict:
+    """
+    رُل‌اوت ایمیج جدید روی «یک» اینستنس موجود:
+      docker compose up -d --force-recreate → کانتینر با Image ID جدیدِ پشت تگ
+      BOT_IMAGE بازسازی می‌شود (الگوی امنِ همان README و add_video_link.py).
+    داده‌ها امن هستند: sessions/downloads/exports/… همه bind-mount اند و
+    recreate فقط کانتینر را عوض می‌کند، نه پوشه‌ها را.
+    """
+    order_id = int(order_id)
+    comp = compose_file(order_id)
+    if not comp.exists():
+        return {"ok": False, "container": f"bot_{order_id}",
+                "error": f"compose.yml اینستنس bot_{order_id} پیدا نشد (provision کامل نشده؟)."}
+    try:
+        await run_cmd(
+            docker_cmd() + ["-p", f"bot_{order_id}", "-f", str(comp), "up", "-d", "--force-recreate"],
+            timeout=180,
+        )
+    except OrchestratorError as e:
+        return {"ok": False, "container": f"bot_{order_id}", "error": str(e)}
+
+    started = await wait_for_startup(order_id, timeout=config.DEPLOY_STARTUP_TIMEOUT)
+    if not started:
+        return {"ok": False, "container": f"bot_{order_id}",
+                "error": "کانتینر بازسازی شد ولی مارکر استارتاپ دیده نشد؛ "
+                         f"لاگ: docker logs --tail 50 bot_{order_id}"}
+    logger.info("🔄 bot_%s با ایمیج جدید بازسازی شد", order_id)
+    return {"ok": True, "container": f"bot_{order_id}", "error": ""}
+
+
+async def rollout_all() -> dict:
+    """
+    🚀 رُل‌اوت ایمیج جدید روی «همه» اینستنس‌های deployed — سریال و امن:
+    هر اینستنس جداگانه force-recreate + health-check می‌شود تا موجِ فشار همزمان
+    روی سرور/دیتابیس نیفتد (همان حلقه دستی README، اما خودکار و از داخل ربات).
+    اینستنس‌های stopped دست نمی‌خورند — با اولین start بعدی، چون up -d با
+    Image ID جدید اجرا می‌شود، خودشان ایمیج جدید را می‌گیرند.
+    """
+    async with async_session() as session:
+        ids = [int(r[0]) for r in (await session.execute(
+            text("SELECT id FROM orders WHERE status='deployed' ORDER BY id ASC")
+        )).all()]
+
+    if not ids:
+        return {"ok": True, "total": 0, "done": 0, "failed": 0, "details": []}
+
+    done, failed, details = 0, 0, []
+    for oid in ids:
+        r = await redeploy(oid)
+        if r.get("ok"):
+            done += 1
+            details.append(f"✅ bot_{oid}")
+        else:
+            failed += 1
+            details.append(f"❌ bot_{oid}: {r.get('error', '')[:150]}")
+    logger.info("🚀 رُل‌اوت کامل شد: %s موفق / %s ناموفق از %s", done, failed, len(ids))
+    return {"ok": failed == 0, "total": len(ids), "done": done, "failed": failed,
+            "details": details}
+
+
 async def destroy(order_id: int, drop_db: bool = True) -> dict:
     order_id = int(order_id)
     inst = instance_path(order_id)

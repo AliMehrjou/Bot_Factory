@@ -298,17 +298,43 @@ DC تلگرام وصل می‌شوند:
 
 ## 🔁 به‌روزرسانی همه ربات‌ها (قدرت روش ایمیج)
 
+> **چرا دو گام لازم است؟** کانتینر در لحظه ساخت به **Image ID** (نه تگ) قفل می‌شود؛
+> `docker build` با تگ ثابت فقط اشاره‌گرِ تگ را جابجا می‌کند و کانتینرهای در حال اجرا
+> همان نسخه قدیمی را اجرا می‌کنند. تنها راه اعمال ایمیج جدید، **Recreate** کانتینرهاست.
+> (گام ۲ حالا از داخل خود ربات هم قابل اجراست — پایین‌تر را ببینید.)
+
+**گام ۱ — ساخت ایمیج جدید:**
+
 ```bash
 cd /opt/factory/source/sender_bot
 git pull        # یا rsync سورس جدید
 bash /opt/bot_factory/scripts/build_sender_image.sh     # build جدید + تگ تاریخ
+```
 
-# راه‌اندازی مجدد همه اینستنس‌ها (بدون از دست رفتن داده — bind-mount هستند):
+**گام ۲ — رُل‌اوت روی اینستنس‌های موجود (یکی از سه راه):**
+
+```bash
+# راه الف) اسکریپت آماده (سریال + گزارش:
+bash /opt/bot_factory/scripts/rollout_all.sh
+
+# راه ب) از داخل ربات: پنل ادمین → 🎛 اینستنس‌ها → «🚀 آپدیت همه با ایمیج جدید»
+#         (همان منطق را از صف دیپلوی و بدون فشار همزمان اجرا می‌کند؛
+#          برای یک اینستنس خاص هم دکمه «🔄 آپدیت <ID>» کنار هر ردیف هست.)
+
+# راه ج) حلقه دستی (معادل همان است):
 for d in /opt/factory/instances/bot_*; do
   id=$(basename "$d" | cut -d_ -f2)
   docker compose -p "bot_$id" -f "$d/compose.yml" up -d --force-recreate
 done
-# rollback:  docker tag sender_bot:20260101 sender_bot:v1  و تکرار همین حلقه
+```
+
+داده‌ها امن هستند (sessions/downloads/exports/… bind-mount اند) و recreate فقط
+کانتینر را عوض می‌کند، نه پوشه‌ها را. اینستنس‌های متوقف هم بعد از اولین start
+خودکار ایمیج جدید را می‌گیرند (`up -d` در Compose v2 با تغییر Image ID کانتینر را
+Recreate می‌کند).
+
+```
+# rollback:  docker tag sender_bot:20260101 sender_bot:v1  و تکرار گام ۲
 ```
 
 ---
@@ -320,7 +346,7 @@ done
 | `Too many connections` | `docker exec factory_mysql mysql -uroot -p… -e "SHOW VARIABLES LIKE 'max_connections';"` باید 1000 باشد (هم‌اندازه `MYSQL_MAX_CONNECTIONS` در `.env`)؛ my.cnf مونت شده؟ |
 | سفارش fail: «image not found» | `bash scripts/build_sender_image.sh` هنوز اجرا نشده |
 | «ظرفیت Redis پر است» | `NUM_REDIS` در `.env` را زیاد کنید + کانتینر redis جدید در `docker-compose.yml` + `docker compose up -d` + ری‌استارت ربات |
-| سینک پروکسی fail برای اینستنس تازه | طبیعی است تا جدول‌ها ساخته شوند (~۱ دقیقه)؛ سیکل بعدی خودش ردیف می‌شود |
+| سینک پروکسی fail برای اینستنس تازه | تا ~۱ دقیقه (تا جدول‌ها ساخته شوند) ممکن است؛ پس از اصلاح B1 مسیر `sync_instance` پس از provision واقعاً منتظر جدول می‌ماند و خودش سینک می‌کند — دیگر نباید ۳ تا ۱۵ دقیقه معطل سیکل بعدی بماند |
 | instance بعد از استارت خاموش | `docker logs --tail 100 bot_{id}` — معمولاً توکن/PORT یا رمز DB در `.env` |
 | دیسک پر شد | `docker system df`؛ لاگ‌ها محدود شده‌اند ولی volumes دانلود مشتری‌ها را چک کنید |
 

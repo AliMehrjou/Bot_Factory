@@ -12,6 +12,7 @@
 🎯 برای مدیریت «تفکیک‌شده هر اینستنس» (لاگین/سندر اختصاصی) از دکمه
   «🗂 پروکسی اینستنس‌ها» یا لیست اینستنس‌ها (/panel → اینستنس‌ها) استفاده کنید.
 """
+import asyncio
 import logging
 import datetime as dt
 
@@ -30,6 +31,15 @@ from database.models import FactoryProxy, InstanceProxy, Order
 from sqlalchemy import update, select
 
 logger = logging.getLogger(__name__)
+
+
+async def _bg_sync_after_manual_test():
+    """🩹 (B4) سینک پس‌زمینه بعد از تغییر وضعیتِ واقعی در تست دستی."""
+    try:
+        await proxy_manager.sync_all_instances("تست دستی ادمین")
+    except Exception:
+        logger.exception("سینک پس از تست دستی ناموفق")
+
 router = Router(name="proxy_panel")
 
 
@@ -320,19 +330,22 @@ async def cb_test_one(cb: CallbackQuery):
     if not p:
         return await cb.message.answer("❌ پروکسی یافت نشد.")
     ok, latency = await proxy_manager._check_one(p)
-    new_status = ("weak" if (latency or 0) > config.PROXY_WEAK_MS else "active") if ok else "dead"
-    async with async_session() as session:
-        await session.execute(
-            update(FactoryProxy).where(FactoryProxy.id == pid)
-            .values(status=new_status, ping_ms=latency,
-                    last_checked_at=dt.datetime.now(dt.timezone.utc)))
-        await session.commit()
-    icon = {"active": "🟢", "weak": "🟡", "dead": "🔴"}[new_status]
+    # 🩹 FIX (B4): نتیجه تست از طریق ماشین وضعیت اعمال می‌شود — یک شکستِ
+    # لحظه‌ای دیگر پروکسی را فوراً dead نمی‌کند (قواعد consec مثل check_cycle).
+    new_status, ping, transitioned = await proxy_manager.apply_manual_check_result(pid, ok, latency)
+    icon = {"active": "🟢", "weak": "🟡", "dead": "🔴"}.get(new_status or "dead", "⚪")
+    note = ""
+    if ok and new_status == "dead":
+        note = (f"\nℹ️ برای بازیابی کامل از DEAD، {config.PROXY_RECOVER_OKS} موفقیت پیاپی "
+                f"(تست یا سیکل بعدی) لازم است.")
+    if transitioned:
+        note += "\n🔄 تغییر وضعیت واقعی رخ داد؛ سینک پس‌زمینه در جریان است."
+        asyncio.create_task(_bg_sync_after_manual_test())
     await cb.message.answer(
         f"⚡ <b>نتیجه تست پروکسی #{pid}</b>\n"
         f"{icon} <code>{p.scheme}://{p.proxy_string}</code>\n"
         f"{'✅ موفق — پینگ: ' + str(latency) + 'ms' if ok else '❌ ناموفق (اتصال برقرار نشد)'}\n\n"
-        f"وضعیت استخر به «{new_status}» به‌روز شد.",
+        f"وضعیت استخر: «{new_status}» (ماشین وضعیت).{note}",
         reply_markup=proxy_detail_kb(pid, False),
     )
 
