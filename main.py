@@ -97,7 +97,7 @@ async def on_startup(bot: Bot):
         _bg_tasks.add(t)
         t.add_done_callback(_bg_tasks.discard)
         
-    from sqlalchemy import select
+    from sqlalchemy import select, text
     from database import async_session
     from database.models import Order
     from core.deploy_queue import DeployJob
@@ -120,6 +120,47 @@ async def on_startup(bot: Bot):
             if o.renew_of:
                 continue
             deploy_queue.submit(DeployJob(action="provision", order_id=o.id, done_cb=make_startup_cb(o.id)))
+
+    # --- 🩹 FIX (D2): بازیابی جاب‌های معوق stop/start/destroy پس از ری‌استارت ---
+    # صف دیپلوی حافظه‌ای (asyncio.Queue) است؛ اگر ربات بین تأیید ادمین و اجرای جاب
+    # ری‌استارت شود، سفارش برای همیشه در وضعیت گذرا (stopping/starting/destroying)
+    # می‌ماند → توکن قفل و ردیف از لیست اینستنس‌ها خارج. حالا هنگام بوت:
+    #   • destroying → جاب حذف دوباره صف می‌شود (عملیات حذف idempotent است)
+    #   • stopping/starting → وضعیت با واقعیت داکر تطبیق داده می‌شود
+    try:
+        from core import orchestrator as _orch
+        async with async_session() as session:
+            stuck = (await session.scalars(
+                select(Order).where(Order.status.in_(("stopping", "starting", "destroying")))
+            )).all()
+
+        for o in stuck:
+            if o.status == "destroying":
+                async def _destroy_cb(result: dict, oid=o.id):
+                    if result.get("ok"):
+                        await notify_admins(f"💥 حذف نیمه‌کارهٔ bot_{oid} پس از ری‌استارت تکمیل شد.")
+                    else:
+                        await notify_admins(
+                            f"🟥 تکمیل حذف bot_{oid} پس از ری‌استارت باز هم ناقص ماند:\n"
+                            f"{str(result.get('error') or '')[:300]}")
+                deploy_queue.submit(DeployJob(action="destroy", order_id=o.id, done_cb=_destroy_cb))
+                logger.warning("جاب حذف گم‌شدهٔ bot_%s دوباره در صف قرار گرفت", o.id)
+            else:
+                try:
+                    st = await _orch.status(o.id)
+                    real = "deployed" if st.get("running") else "stopped"
+                except Exception:
+                    real = "stopped"
+                async with async_session() as session:
+                    await session.execute(
+                        text("UPDATE orders SET status=:s WHERE id=:o"),
+                        {"s": real, "o": o.id})
+                    await session.commit()
+                logger.warning("وضعیت گذرای bot_%s (%s) با واقعیت داکر (%s) تطبیق یافت",
+                               o.id, o.status, real)
+    except Exception:
+        logger.exception("بازیابی جاب‌های معوق (D2) ناموفق — ادامهٔ بوت")
+    # ---------------------------------------------------------------
 
     await bot.set_my_commands([
         BotCommand(command="start", description="سفارش ربات جدید"),

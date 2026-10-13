@@ -14,6 +14,23 @@
 import re
 from dataclasses import dataclass
 from typing import Optional
+from urllib.parse import quote, unquote
+
+
+def build_proxy_url(scheme: str, host, port, username: str = "", password: str = "") -> str:
+    """
+    🩹 FIX (P4): ساخت URL کامل پروکسی با اعتبارنامهٔ URL-encode شده.
+    پسوردهای دارای کاراکترهای خاص (@ : / # ؟ و غیر-ASCII — در پروکسی‌های واقعی
+    بسیار رایج) قبلاً خام چسبانده می‌شدند → URL خراب → python-socks اتصال را
+    fail می‌کرد → پروکسی کاملاً سالم سه شکست می‌خورد و «dead» می‌شد.
+    python-socks سمت خودش username/password را unquote می‌کند؛ راند-تریپ سالم است.
+    «رشتهٔ خام» user:pass@host:port (فرمت ذخیره در دیتابیس اینستنس) تغییر نمی‌کند.
+    """
+    if username:
+        u = quote(str(username), safe="")
+        p = quote(str(password or ""), safe="")
+        return f"{scheme}://{u}:{p}@{host}:{port}"
+    return f"{scheme}://{host}:{port}"
 
 
 @dataclass
@@ -33,9 +50,8 @@ class ParsedProxy:
 
     @property
     def url(self) -> str:
-        if self.username:
-            return f"{self.scheme}://{self.username}:{self.password}@{self.host}:{self.port}"
-        return f"{self.scheme}://{self.host}:{self.port}"
+        # 🩹 FIX (P4): از سازندهٔ امن با quote استفاده می‌کند
+        return build_proxy_url(self.scheme, self.host, self.port, self.username, self.password)
 
 
 _IPV4 = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
@@ -57,7 +73,9 @@ def parse_proxy_line(line: str, default_scheme: str = "socks5") -> Optional[Pars
         return None
 
     scheme = default_scheme
+    had_scheme = False
     if "://" in line:
+        had_scheme = True
         scheme_raw, _, rest = line.partition("://")
         scheme = scheme_raw.lower()
         if scheme not in ("socks5", "socks5h", "socks4", "http", "https"):
@@ -70,7 +88,17 @@ def parse_proxy_line(line: str, default_scheme: str = "socks5") -> Optional[Pars
     if "@" in line:
         creds, _, hostport = line.rpartition("@")
         username, sep, password = creds.partition(":")
-        
+
+        # 🩹 FIX (P4 — راند-تریپ): اگر خط از فرم URL (scheme://user:pass@...) آمده باشد،
+        # اعتبارنامه طبق استاندارد URL می‌تواند percent-encode شده باشد (خروجی بکاپ/
+        # export همین‌کد quote شده تولید می‌کند). unquote فقط %XX معتبر را باز می‌کند؛
+        # فرمت‌های دو-نقطه‌ای (host:port:user:pass) عمداً دست‌نخورده می‌مانند چون
+        # هیچ قرارداد کدگذاری ندارند و کاراکتر خام بخشی از خود پسورد است.
+        if had_scheme and "%" in username:
+            username = unquote(username)
+        if had_scheme and "%" in password:
+            password = unquote(password)
+
         # اگر جداکننده کاربر/رمز درست بود
         if sep == ":":
             if ":" in hostport:

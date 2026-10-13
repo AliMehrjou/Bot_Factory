@@ -86,11 +86,18 @@ async def instances_monitor_loop() -> None:
                             f"تلاش برای اجرای مجدد...",
                             key=f"down:{oid}",
                         )
+                        # 🩹 FIX (S1): استارتِ خودکار قبلاً مستقیماً orchestrator.start()
+                        # می‌زد و از صف دیپلوی رد می‌شد → با جاب‌های stop/destroy مسابقه
+                        # می‌داد (توقف ادمین بی‌صدا خنثی می‌شد؛ بدتر: وسط destroy کانتینر
+                        # دوباره بالا می‌آمد و کانتینر زامبیِ دارندهٔ توکن می‌ماند).
+                        # حالا استارت مانیتور هم از همان صف سریال عبور می‌کند؛ کارگر صف
+                        # پیش از اجرا، وضعیت را دوباره با واقعیت داکر تطبیق می‌دهد.
                         try:
-                            await orchestrator.start(int(oid))
+                            from core.deploy_queue import DeployJob, deploy_queue
+                            deploy_queue.submit(DeployJob(action="start", order_id=int(oid)))
                         except Exception as e:
                             await _alert(
-                                f"🔴 اجرای مجدد bot_{oid} ناموفق: {e}",
+                                f"🔴 ارسال جاب استارت مجدد bot_{oid} به صف ناموفق: {e}",
                                 key=f"restart:{oid}",
                             )
         except asyncio.CancelledError:

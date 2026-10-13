@@ -123,9 +123,99 @@ async def validate_bot_token(token: str) -> dict:
     bot = data.get("result", {})
     return {
         "ok": True,
+        "bot_id": bot.get("id"),
         "username": (bot.get("username") or "").lstrip("@"),
         "title": bot.get("first_name", ""),
     }
+
+
+async def validate_force_join(token: str, channel: str) -> dict:
+    """
+    🩹 FIX (F2): اعتبارسنجی زندهٔ کانال جوین اجباری — قبل از ثبت سفارش:
+      ۱) getChat → کانال واقعاً وجود دارد؟ (تایپوی کاربر / کانال حذف‌شده)
+      ۲) getChatMember → رباتِ مشتری «ادمین» همان کانال است؟
+         (بدون ادمین‌بودن، getChatMember و چک عضویت کاربر در سندربات fail می‌کند
+          و عملاً ربات مشتری برای همه کاربرانش قفل می‌شود.)
+    channel: یوزرنیم بدون @ (مثل "mychannel") یا ایدی عددی (مثل "-1001234567890").
+    خروجی: {"ok": bool, "title": str, "chat_type": str, "error": str, "network_error": bool}
+    """
+    chat_ref = channel if channel.startswith("-") else f"@{channel.lstrip('@')}"
+
+    timeout = aiohttp.ClientTimeout(total=15)
+
+    # --- getMe خود ربات برای گرفتن bot_id (برای چک ادمین‌بودن) ---
+    bot_id = None
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as http:
+            async with http.get(f"https://api.telegram.org/bot{token}/getMe",
+                                proxy=config.OUTBOUND_PROXY or None) as resp:
+                me = await resp.json(content_type=None)
+        if me.get("ok"):
+            bot_id = (me.get("result") or {}).get("id")
+    except Exception as e:
+        logger.warning("getMe (force-join check) network error: %s", e)
+        return {"ok": False, "title": "", "chat_type": "", "error": "", "network_error": True}
+
+    # --- getChat: وجود کانال ---
+    title, chat_type = "", ""
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as http:
+            async with http.get(
+                f"https://api.telegram.org/bot{token}/getChat",
+                params={"chat_id": chat_ref},
+                proxy=config.OUTBOUND_PROXY or None,
+            ) as resp:
+                data = await resp.json(content_type=None)
+    except Exception as e:
+        logger.warning("getChat (force-join check) network error: %s", e)
+        return {"ok": False, "title": "", "chat_type": "", "error": "", "network_error": True}
+
+    if not data.get("ok"):
+        err = data.get("description", "unknown")
+        if "chat not found" in err.lower():
+            return {"ok": False, "title": "", "chat_type": "", "network_error": False,
+                    "error": "کانال پیدا نشد. یوزرنیم را دقیق بررسی کنید (یا ربات را ابتدا به کانال اضافه کنید)."}
+        if "bot is not a member" in err.lower() or "member" in err.lower():
+            return {"ok": False, "title": "", "chat_type": "", "network_error": False,
+                    "error": "ربات شما عضو این کانال نیست. ابتدا ربات را به کانال اضافه کنید و دوباره بفرستید."}
+        return {"ok": False, "title": "", "chat_type": "", "network_error": False,
+                "error": f"تلگرام کانال را نپذیرفت: {err}"}
+
+    chat = data.get("result") or {}
+    title = chat.get("title") or channel
+    chat_type = chat.get("type") or ""
+
+    # --- getChatMember: ربات باید ادمین کانال باشد ---
+    if bot_id:
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as http:
+                async with http.get(
+                    f"https://api.telegram.org/bot{token}/getChatMember",
+                    params={"chat_id": chat_ref, "user_id": bot_id},
+                    proxy=config.OUTBOUND_PROXY or None,
+                ) as resp:
+                    member = await resp.json(content_type=None)
+        except Exception as e:
+            logger.warning("getChatMember (force-join check) network error: %s", e)
+            return {"ok": False, "title": title, "chat_type": chat_type, "error": "", "network_error": True}
+
+        if member.get("ok"):
+            m_status = ((member.get("result") or {}).get("status") or "")
+            if m_status not in ("administrator", "creator"):
+                return {"ok": False, "title": title, "chat_type": chat_type, "network_error": False,
+                        "error": "ربات شما «ادمین» این کانال نیست. بدون دسترسی ادمین، ربات نمی‌تواند "
+                                 "عضویت کاربران را بررسی کند. ابتدا ربات را در کانال ادمین (Admin) کنید "
+                                 "و دوباره همین کانال را بفرستید."}
+        else:
+            err = member.get("description", "unknown")
+            if "not enough rights" in err.lower() or "admin" in err.lower():
+                return {"ok": False, "title": title, "chat_type": chat_type, "network_error": False,
+                        "error": "ربات شما ادمین این کانال نیست. ابتدا ربات را ادمین کنید و دوباره بفرستید."}
+            # خطاهای دیگر getChatMember را غیرمهلک در نظر می‌گیریم — کانال موجود است
+            logger.warning("getChatMember پاسخ غیرمنتظره: %s", err)
+
+    return {"ok": True, "title": title, "chat_type": chat_type,
+            "error": "", "network_error": False}
 
 
 # ============================================================
@@ -542,12 +632,59 @@ async def rollout_all() -> dict:
 
 
 async def destroy(order_id: int, drop_db: bool = True) -> dict:
+    """
+    💥 حذف کامل اینستنس — 🩹 FIX (D1/D5): نسخهٔ قبل شکننده بود:
+      • هر Exception در قدم‌های میانی (فلاش ردیس، drop دیتابیس، حذف پوشه) کل جاب را
+        سقوط می‌داد و وضعیت «destroyed» هرگز ثبت نمی‌شد → توکن برای همیشه قفل می‌شد
+        («این سفارش قبلاً ثبت شده است») و کانتینر/پوشه/دیتابیس نیمه‌کاره می‌ماند.
+      • run_cmd حتی با check=False روی تایم‌اوت Exception می‌داد → داکرِ کند،
+        down را سقوط می‌داد قبل از هر پاکسازی.
+    نسخهٔ جدید:
+      • قدم صفر: وضعیت میانی «destroying» → مانیتور سلامت و چک توکن در طول حذف
+        سفارش را «در حال حذف» می‌بینند و تداخل/race رخ نمی‌دهد.
+      • هر قدم در try/except مستقل؛ خطاها جمع می‌شوند ولی بقیهٔ پاکسازی ادامه می‌یابد.
+      • بعد از down، وجودِ واقعی کانتینر چک می‌شود و در صورت لزوم docker rm -f
+        (سدِ آخرِ کانتینر زامبی که توکن را در تلگرام قفل می‌کند — خطای 409).
+      • وضعیت پایانی «همیشه» نوشته می‌شود: destroyed (موفق) یا destroy_failed + دلیل.
+      • کل عملیات idempotent است — تکرار حذف روی حذفِ ناقص، امن است.
+    """
     order_id = int(order_id)
     inst = instance_path(order_id)
+    errors = []
 
-    # ۱) خاموشی و حذف کانتینر
-    await run_cmd(docker_cmd() + ["-p", f"bot_{order_id}", "-f", str(inst / "compose.yml"), "down"],
-                  timeout=120, check=False)
+    # ۰) وضعیت میانی — کل بازهٔ حذف، سفارش از دید مانیتور/چک توکن «در حال حذف» است
+    try:
+        async with async_session() as session:
+            await session.execute(
+                text("UPDATE orders SET status='destroying' WHERE id=:oid"),
+                {"oid": order_id})
+            await session.commit()
+    except Exception as e:
+        errors.append(f"ثبت وضعیت destroying: {e}")
+        logger.error("ثبت وضعیت destroying برای %s ناموفق: %s", order_id, e)
+
+    # ۱) خاموشی و حذف کانتینر — تایم‌اوت بلند + check=False + تلاش دوم با rm -f
+    comp = inst / "compose.yml"
+    if comp.exists():
+        try:
+            await run_cmd(docker_cmd() + ["-p", f"bot_{order_id}", "-f", str(comp), "down"],
+                          timeout=300, check=False)
+        except Exception as e:
+            errors.append(f"docker down: {e}")
+            logger.error("خطا در down bot_%s (ادامهٔ حذف): %s", order_id, e)
+
+    # سدِ آخرِ کانتینر زامبی: اگر inspect هنوز کانتینری می‌بیند، با rm -f برش دار
+    try:
+        st = await status(order_id)
+        if st.get("exists"):
+            logger.warning("کانتینر bot_%s پس از down هنوز موجود است — docker rm -f", order_id)
+            await run_cmd(["docker", "rm", "-f", f"bot_{order_id}"], timeout=60, check=False)
+            st2 = await status(order_id)
+            if st2.get("exists"):
+                errors.append("کانتینر حتی پس از docker rm -f هنوز موجود است (داکر بیمار؟)")
+    except Exception as e:
+        errors.append(f"بررسی/حذف کانتینر: {e}")
+        logger.error("بررسی وضعیت کانتینر bot_%s ناموفق: %s", order_id, e)
 
     # ۲-الف) خواندن اسلات و حذف کاربر ACL ردیس پیش از آزادسازی اسلات
     try:
@@ -556,36 +693,46 @@ async def destroy(order_id: int, drop_db: bool = True) -> dict:
                 text("SELECT redis_slot FROM orders WHERE id = :oid"),
                 {"oid": order_id}
             )).first()
-            
+
             if row is not None and row[0] is not None:
                 slot = int(row[0])
                 redis_container, _ = config.redis_for_slot(slot)
                 redis_user = f"bot_{order_id}"
-                
+
                 await run_cmd([
-                    "docker", "exec", 
+                    "docker", "exec",
                     "-e", f"REDISCLI_AUTH={config.REDIS_PASS}",
                     redis_container,
                     "redis-cli", "ACL", "DELUSER", redis_user
                 ], timeout=15, check=False)
                 logger.info("🗑 کاربر ACL ردیس %s حذف شد", redis_user)
     except Exception as e:
+        errors.append(f"حذف ACL ردیس: {e}")
         logger.warning("خطا در حذف کاربر ACL ردیس سفارش %s: %s", order_id, e)
 
     # ۲-ب) آزادسازی اسلات (فلاش داده‌های ردیس انجام می‌شود)
-    await free_redis_slot(order_id)
+    try:
+        await free_redis_slot(order_id)
+    except Exception as e:
+        errors.append(f"آزادسازی اسلات redis: {e}")
+        logger.error("خطا در آزادسازی اسلات redis سفارش %s (ادامهٔ حذف): %s", order_id, e)
 
     # ۲-ج) 🎯 پاکسازی تخصیص‌های پروکسی این اینستنس (جدول instance_proxies)
     try:
         from core.instance_proxies import cleanup_instance
         await cleanup_instance(order_id)
     except Exception as e:
+        errors.append(f"پاکسازی تخصیص پروکسی: {e}")
         logger.warning("پاکسازی تخصیص پروکسی bot_%s ناموفق: %s", order_id, e)
 
     # ۳) حذف دیتابیس مشتری و کاربر ایزوله
     if drop_db:
-        db_user = f"sender_{order_id}"
-        await drop_database(order_id, db_user)
+        try:
+            db_user = f"sender_{order_id}"
+            await drop_database(order_id, db_user)
+        except Exception as e:
+            errors.append(f"حذف دیتابیس: {e}")
+            logger.error("خطا در حذف دیتابیس sender_%s (ادامهٔ حذف): %s", order_id, e)
 
     # ۴) حذف ایمن پوشه
     def _remove_instance_dir():
@@ -593,12 +740,31 @@ async def destroy(order_id: int, drop_db: bool = True) -> dict:
             import shutil
             shutil.rmtree(inst)
 
-    await asyncio.to_thread(_remove_instance_dir)
+    try:
+        await asyncio.to_thread(_remove_instance_dir)
+    except Exception as e:
+        errors.append(f"حذف پوشه اینستنس: {e}")
+        logger.error("خطا در حذف پوشه bot_%s (ادامهٔ حذف): %s", order_id, e)
 
-    async with async_session() as session:
-        await session.execute(text("UPDATE orders SET status='destroyed' WHERE id=:oid"),
-                              {"oid": order_id})
-        await session.commit()
+    # ۵) وضعیت نهایی — «همیشه» نوشته می‌شود (قلبِ رفع قفل توکن)
+    final_status = "destroyed" if not errors else "destroy_failed"
+    try:
+        async with async_session() as session:
+            await session.execute(
+                text("UPDATE orders SET status=:s, fail_reason=:r WHERE id=:oid"),
+                {"s": final_status,
+                 "r": ("\n".join(errors)[:1000] if errors else ""),
+                 "oid": order_id})
+            await session.commit()
+    except Exception as e:
+        # حتی این هم نباید سقوط کند — ولی اگر دیتابیس قطع است کاری از دست ما برنمی‌آید
+        logger.critical("ثبت وضعیت نهایی حذف bot_%s ناموفق: %s", order_id, e)
+
+    if errors:
+        logger.error("💥 حذف bot_%s با %s خطا کامل شد (destroy_failed): %s",
+                     order_id, len(errors), errors)
+        return {"ok": False, "error": "\n".join(errors)[:1000],
+                "container": f"bot_{order_id}"}
 
     logger.info("💥 اینستنس bot_%s کاملاً حذف شد", order_id)
     return {"ok": True, "container": f"bot_{order_id}"}

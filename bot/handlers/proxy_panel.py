@@ -267,11 +267,53 @@ async def cb_disable(cb: CallbackQuery):
 async def cb_enable(cb: CallbackQuery):
     pid = int(cb.data.split(":")[2])
     async with async_session() as session:
-        await session.execute(update(FactoryProxy).where(FactoryProxy.id == pid).values(status="active"))
+        p = await session.get(FactoryProxy, pid)
+    if not p:
+        return await cb.answer("❌ پروکسی یافت نشد", show_alert=True)
+
+    # 🩹 FIX (PX-A): قبلاً دکمهٔ فعال‌سازی فقط status='active' می‌نوشت — بدون ریست
+    # شمارنده‌ها، بدون تست زنده و بدون سینک (عدم تقارن با disable که سینک می‌کرد).
+    # یک پروکسی واقعاً مرده که ادمین فعال می‌کرد، تا سیکل بعد به‌عنوان HEALTHY به
+    # همه اینستنس‌هایش سینک می‌شد و بعد دوباره dead می‌شد — نوسان بی‌دلیل.
+    # حالا: ریست شمارنده‌ها + تست زندهٔ فوری + اعمال نتیجه از طریق ماشین وضعیت
+    # (apply_manual_check_result) + سینک پس‌زمینه در هر صورت (تخصیص باید بنشیند).
+    async with async_session() as session:
+        await session.execute(
+            update(FactoryProxy).where(FactoryProxy.id == pid).values(
+                status="active",   # فعالِ «در انتظار تأیید تست» — ماشین وضعیت تصمیم نهایی را می‌گیرد
+                consec_ok=0,       # شمارنده‌های دورهٔ قبلی (مثلاً ۳ شکست پیاپی) ریست شود
+                consec_fail=0,
+                ping_ms=None,
+                last_synced_at=None,   # سینک بعدی قطعاً این ردیف را دوباره می‌نویسد
+            ))
         await session.commit()
-    await cb.answer("🟢 فعال شد")
+
+    await cb.answer("⚡ فعال شد — تست زنده در جریان…")
+    ok, latency = await proxy_manager._check_one(p)
+    new_status, ping, transitioned = await proxy_manager.apply_manual_check_result(pid, ok, latency)
+
+    # سینک پس‌زمینه — هم برای نشاندن پروکسیِ سالم، هم برای برداشتن آن اگر مرده درآمد
+    asyncio.create_task(_bg_sync_after_manual_test())
+
+    icon = {"active": "🟢", "weak": "🟡", "dead": "🔴"}.get(new_status or "dead", "⚪")
+    if ok:
+        msg = (f"🟢 پروکسی #{pid} فعال و تست زنده موفق بود "
+               f"(پینگ: {latency}ms).\n🔄 سینک به اینستنس‌ها در جریان است.")
+    else:
+        msg = (f"🟡 پروکسی #{pid} فعال شد اما تست زندهٔ اولیه ناموفق بود.\n"
+               f"وضعیت فعلی استخر: {icon} «{new_status}» — اگر واقعاً مرده باشد، پس از "
+               f"{config.PROXY_DEAD_FAILS} شکست پیاپی در سیکل‌های بعدی dead می‌شود و از "
+               f"اینستنس‌ها خارج خواهد شد.\n🔄 سینک در جریان است.")
+    try:
+        await cb.message.answer(msg)
+    except Exception:
+        pass
+
     text, proxies = await proxy_manager.top_list_with_objects(20)
-    await cb.message.edit_text(text, reply_markup=proxy_list_manage_kb(proxies))
+    try:
+        await cb.message.edit_text(text, reply_markup=proxy_list_manage_kb(proxies))
+    except Exception:
+        pass
 
 
 # ============================================================

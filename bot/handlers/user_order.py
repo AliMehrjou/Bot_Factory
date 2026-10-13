@@ -24,13 +24,29 @@ from bot.keyboards import (plans_kb, skip_force_join_kb, confirm_summary_kb,
                            approval_kb, start_menu_kb, mybots_kb,
                            not_charged_kb, manual_build_kb)
 from config import config, fmt_price
-from core.orchestrator import validate_bot_token
+from core.orchestrator import validate_bot_token, validate_force_join
 from database import async_session
 from database.models import Order
 from utils.media_store import send_training_video
 
 logger = logging.getLogger(__name__)
 router = Router(name="user_order")
+
+# 🩹 FIX (R4): لیست سفید وضعیت‌های «فعال» که توکن را قفل می‌کنند.
+# نسخهٔ قبل لیست سیاه داشت (rejected/failed/destroyed) → هر وضعیت ناشناخته یا
+# گذرای آینده به‌نفع قفل شدن توکن تفسیر می‌شد و خرید مجدد بعد از حذف ناموفق/
+# نیمه‌کاره برای همیشه بلاک می‌ماند. حالا فقط وضعیت‌های واقعاً فعال قفل می‌کنند.
+_TOKEN_LOCKING_STATUSES = (
+    "awaiting_approval",   # در انتظار تأیید پشتیبانی
+    "approved",            # تأییدشده — در صف ساخت
+    "provisioning",        # در حال ساخت
+    "deployed",            # فعال
+    "stopped",             # متوقف (داده‌ها موجود است — تمدید/استارت مجدد)
+    "stopping", "starting", "destroying",  # عملیات در جریان
+    "renewed",             # تمدیدشده
+    "expired",             # منقضی — فقط مسیر تمدید باز است
+    "destroy_failed",      # حذف ناقص — تا تکمیل حذف، توکن قفل می‌ماند (ریسک 409)
+)
 
 
 def _support_url() -> str | None:
@@ -343,10 +359,11 @@ async def st_bot_token(message: Message, state: FSMContext):
         
     async with async_session() as session:
         # ۱. بررسی تکراری نبودن سفارش
+        # 🩹 FIX (R4): لیست سفید — فقط وضعیت‌های فعال توکن را قفل می‌کنند
         query = select(Order).where(
             Order.tg_id == tg_id,
-            Order.bot_token == token,  # استفاده از متغیر token به جای data.get
-            Order.status.notin_(('rejected', 'failed', 'destroyed'))
+            Order.bot_token == token,
+            Order.status.in_(_TOKEN_LOCKING_STATUSES)
         )
         
         # در صورت تمدید، ربات فعلی را از بررسی تکراری بودن استثنا کن
@@ -355,7 +372,12 @@ async def st_bot_token(message: Message, state: FSMContext):
             
         exists = await session.scalar(query)
         if exists:
-            return await message.answer("❌ این سفارش قبلاً ثبت شده است.")  # اصلاح cb به message
+            return await message.answer(
+                "❌ این توکن قبلاً برای سفارش ثبت شده است.\n\n"
+                "🔹 اگر ربات را از /mybots دارید، از دکمه «تمدید» استفاده کنید.\n"
+                "🔹 اگر سفارش قبلی را حذف کرده‌اید و این پیام را می‌بینید،"
+                " حذف کامل نشده — به پشتیبانی اطلاع دهید."
+            )
             
     checking = await message.answer("🔍 در حال بررسی توکن از تلگرام...")
     result = await validate_bot_token(token)
@@ -365,6 +387,7 @@ async def st_bot_token(message: Message, state: FSMContext):
         
     await state.update_data(
         bot_token=token,
+        bot_id=result.get("bot_id"),
         bot_username=result["username"],
         bot_title=result["title"],
     )
@@ -409,8 +432,10 @@ async def st_api_hash(message: Message, state: FSMContext):
     await state.update_data(api_hash=raw.lower())
     await message.answer(
         "📢 <b>مرحله آخر قبل از پرداخت:</b>\n\n"
-        "اگر می‌خواهید کاربران ربات شما مجبور به عضویت در یک کانال شوند، "
-        "یوزرنیم کانال را بفرستید (مثل <code>@yourchannel</code>).\n"
+        "اگر می‌خواهید کاربران ربات شما مجبور به عضویت در یک کانال شوند، کانال را بفرستید:\n"
+        "• یوزرنیم کانال مثل <code>@yourchannel</code>\n"
+        "• یا ایدی عددی کانال مثل <code>-1001234567890</code> (کانال‌های بدون یوزرنیم عمومی)\n\n"
+        "⚠️ ربات شما باید «عضو» آن کانال باشد و بهتر است آن را «ادمین» کنید تا بررسی عضویت کاربران ممکن شود.\n"
         "اگر نمی‌خواهید، دکمه رد شدن را بزنید.",
         reply_markup=skip_force_join_kb(),
     )
@@ -427,12 +452,72 @@ async def st_fj_skip(cb: CallbackQuery, state: FSMContext):
 @router.message(OrderFlow.force_join, F.text)
 async def st_force_join(message: Message, state: FSMContext):
     raw = message.text.strip()
-    if raw.startswith("@"):
-        raw = raw[1:]
-    if not raw or len(raw) > 64 or not all(c.isalnum() or c == "_" for c in raw):
-        await message.answer("❌ فرمت کانال درست نیست. مثال صحیح: <code>@mychannel</code> — یا دکمه رد شدن.")
+
+    # ---------- 🩹 FIX (F1): تفکیک فرمت‌ها ----------
+    # ۱) ایدی عددی کانال/سوپرگروه (-100…): قبلاً کاراکتر «-» باعث رد شدن می‌شد و
+    #    کاربر کلاً نمی‌توانست کانال خصوصی را ثبت کند.
+    # ۲) عدد مثبت خام (1234567890): قبلاً پذیرفته می‌شد و به شکل خراب «@1234567890»
+    #    ذخیره می‌شد → چک عضویت برای همه کاربران fail و ربات مشتری قفل می‌شد.
+    if raw.startswith("-") and raw[1:].isdigit():
+        if not (7 <= len(raw) <= 20):
+            return await message.answer(
+                "❌ طول ایدی عددی کانال معتبر نیست. ایدی کانال‌ها معمولاً مانند "
+                "<code>-1001234567890</code> است. دوباره بفرستید یا دکمه رد شدن را بزنید."
+            )
+        fj_value = raw  # ایدی عددی عیناً (بدون @) ذخیره می‌شود
+        fj_display = f"<code>{raw}</code>"
+    elif raw.isdigit():
+        return await message.answer(
+            "❌ ایدی مثبت خام برای کانال معتبر نیست.\n"
+            "• ایدی کانال/سوپرگروه با <code>-100</code> شروع می‌شود (مثل <code>-1001234567890</code>)\n"
+            "• یا یوزرنیم کانال را بفرستید (مثل <code>@mychannel</code>)\n\n"
+            "ℹ️ ایدی کانال را از لینک دعوت/آدرس کانال می‌توانید بردارید. دوباره بفرستید یا دکمه رد شدن را بزنید."
+        )
+    else:
+        # مسیر یوزرنیم @name
+        if raw.startswith("@"):
+            raw = raw[1:]
+        if not raw or len(raw) > 64 or not all(c.isalnum() or c == "_" for c in raw):
+            return await message.answer(
+                "❌ فرمت کانال درست نیست. مثال صحیح: <code>@mychannel</code> یا "
+                "<code>-1001234567890</code> — یا دکمه رد شدن."
+            )
+        fj_value = f"@{raw}"
+        fj_display = f"@{raw}"
+
+    # ---------- 🩹 FIX (F2): اعتبارسنجی زنده (getChat + getChatMember) ----------
+    # کانال غلط یا رباتِ غیرادمین، فورس‌جوین را برای همه کاربران ربات مشتری
+    # می‌شکند و این فقط بعد از تحویل کشف می‌شد. حالا قبل از ثبت سفارش چک می‌شود.
+    data = await state.get_data()
+    bot_token = data.get("bot_token")
+    if not bot_token:
+        # حالت خارج از جریان (نباید رخ دهد) — بدون اعتبارسنجی زنده ادامه بده
+        await state.update_data(force_join=fj_value)
+        await _show_summary(message, state)
         return
-    await state.update_data(force_join=f"@{raw}")
+
+    checking = await message.answer(f"🔍 در حال بررسی کانال {fj_display} از تلگرام...")
+    result = await validate_force_join(bot_token, fj_value)
+
+    if result.get("network_error"):
+        await checking.edit_text(
+            "⚠️ اتصال به تلگرام برقرار نشد؛ کانال موقتاً قابل تأیید نیست.\n"
+            "چند لحظه بعد دوباره همین کانال را بفرستید، یا دکمه رد شدن را بزنید."
+        )
+        return
+
+    if not result.get("ok"):
+        await checking.edit_text(
+            f"❌ {result.get('error') or 'کانال تأیید نشد.'}\n\n"
+            "پس از رفع مشکل، دوباره کانال را بفرستید — یا دکمه رد شدن را بزنید."
+        )
+        return
+
+    await state.update_data(force_join=fj_value)
+    await checking.edit_text(
+        f"✅ کانال «<b>{result.get('title') or fj_display}</b>» تأیید شد "
+        f"({fj_display}) و ربات شما دسترسی لازم را دارد."
+    )
     await _show_summary(message, state)
 
 
@@ -497,10 +582,11 @@ async def cb_pay_wallet(cb: CallbackQuery, state: FSMContext, bot: Bot):
 
         async with async_session() as session:
             # ۱. بررسی تکراری نبودن سفارش
+            # 🩹 FIX (R4): همان لیست سفید — فقط وضعیت‌های فعال قفل می‌کنند
             query = select(Order).where(
                 Order.tg_id == tg_id,
                 Order.bot_token == data.get("bot_token", ""),
-                Order.status.notin_(('rejected', 'failed', 'destroyed'))
+                Order.status.in_(_TOKEN_LOCKING_STATUSES)
             )
             
             # در صورت تمدید، ربات قدیمی را از بررسی تکراری بودن استثنا می‌کنیم
@@ -509,7 +595,12 @@ async def cb_pay_wallet(cb: CallbackQuery, state: FSMContext, bot: Bot):
                 
             exists = await session.scalar(query)
             if exists:
-                return await cb.message.answer("❌ این سفارش قبلاً ثبت شده است.")
+                return await cb.message.answer(
+                    "❌ این توکن قبلاً برای سفارش ثبت شده است.\n\n"
+                    "🔹 اگر ربات را از /mybots دارید، از دکمه «تمدید» استفاده کنید.\n"
+                    "🔹 اگر سفارش قبلی را حذف کرده‌اید و این پیام را می‌بینید،"
+                    " حذف کامل نشده — به پشتیبانی اطلاع دهید."
+                )
 
             # ۲. کسر اتمیک موجودی (رفع race دکمه پرداخت)
             res = await session.execute(

@@ -383,12 +383,22 @@ def admin_instances_kb(page_orders, current_page: int, total_pages: int) -> Inli
     sizes = []
     
     for o in page_orders:
+        # 🩹 FIX (S5): وضعیت‌های گذر (stopping/starting/destroying) و destroy_failed
+        # هم اکنون در لیست دیده می‌شوند و دکمه منطقی می‌گیرند (قبلاً موقتاً غیب می‌شدند)
+        ctrl_added = False
         if o.status == "failed":
             b.button(text=f"🔁 سعی مجدد {o.id}", callback_data=f"inst:retry:{o.id}")
-        elif o.status in ("deployed", "running"):
+            ctrl_added = True
+        elif o.status in ("deployed", "running", "starting"):
             b.button(text=f"⏸ توقف {o.id}", callback_data=f"inst:stop:{o.id}")
-        else:
+            ctrl_added = True
+        elif o.status in ("stopped", "stopping"):
             b.button(text=f"▶️ روشن {o.id}", callback_data=f"inst:start:{o.id}")
+            ctrl_added = True
+        elif o.status == "destroy_failed":
+            b.button(text=f"💥 حذف مجدد {o.id}", callback_data=f"inst:destroy:{o.id}")
+            ctrl_added = True
+        # destroying → جاب در جریان است؛ دکمه کنترلی ندارد (فقط حذف/پروکسی)
 
         # 🩹 FIX (رُل‌اوت): دکمه به‌روزرسانی با ایمیج جدید (force-recreate) —
         # قبلاً هیچ راهی از داخل ربات برای اعمال ایمیج ریبیلدشده روی اینستنس
@@ -397,11 +407,18 @@ def admin_instances_kb(page_orders, current_page: int, total_pages: int) -> Inli
             b.button(text=f"🔄 آپدیت {o.id}", callback_data=f"inst:redeploy:{o.id}")
             b.button(text=f"💥 حذف {o.id}", callback_data=f"inst:destroy:{o.id}")
             b.button(text=f"🌐 پروکسی {o.id}", callback_data=f"ipx:menu:{o.id}", style="primary")
-            sizes.append(4)  # چهار دکمه در یک سطر: کنترل | آپدیت | حذف | پروکسی
+            sizes.append(4 if ctrl_added else 3)  # کنترل | آپدیت | حذف | پروکسی
+        elif o.status == "destroying":
+            b.button(text=f"💥 حذف مجدد {o.id}", callback_data=f"inst:destroy:{o.id}")
+            b.button(text=f"🌐 پروکسی {o.id}", callback_data=f"ipx:menu:{o.id}", style="primary")
+            sizes.append(2)  # حذف مجدد | پروکسی (اگر جاب گم شد، ادمین بتواند دوباره بزند)
+        elif o.status == "destroy_failed":
+            b.button(text=f"🌐 پروکسی {o.id}", callback_data=f"ipx:menu:{o.id}", style="primary")
+            sizes.append(2 if ctrl_added else 1)
         else:
             b.button(text=f"💥 حذف {o.id}", callback_data=f"inst:destroy:{o.id}")
             b.button(text=f"🌐 پروکسی {o.id}", callback_data=f"ipx:menu:{o.id}", style="primary")
-            sizes.append(3)  # سه دکمه در یک سطر: کنترل | حذف | پروکسی
+            sizes.append(3 if ctrl_added else 2)  # کنترل | حذف | پروکسی
         
     nav_buttons = 0
     if current_page > 1:
@@ -427,8 +444,12 @@ def admin_instances_kb(page_orders, current_page: int, total_pages: int) -> Inli
 async def _instances_view(cb: CallbackQuery, page: int = 1):
     per_page = 6  # ۶ ربات در هر صفحه تا کیبورد بیش از حد بزرگ نشود (۱۴ دکمه)
     async with async_session() as session:
+        # 🩹 FIX (S5): وضعیت‌های گذرا و destroy_failed هم در لیست می‌آیند —
+        # قبلاً ردیف اینستنس در حال عملیات موقتاً «غیب» می‌شد و گیج‌کننده بود
         orders = (await session.scalars(
-            select(Order).where(Order.status.in_(("deployed", "stopped", "failed")))
+            select(Order).where(Order.status.in_(
+                ("deployed", "stopped", "failed",
+                 "stopping", "starting", "destroying", "destroy_failed")))
             .order_by(Order.id.desc())
         )).all()
 
@@ -457,14 +478,16 @@ async def _instances_view(cb: CallbackQuery, page: int = 1):
         except Exception:
             state = "؟"
 
-        status_icon = {"deployed": "🟢", "stopped": "⏸", "failed": "🔴"}.get(o.status, "⚪")
+        status_icon = {"deployed": "🟢", "stopped": "⏸", "failed": "🔴",
+                       "stopping": "⏳", "starting": "⏳",
+                       "destroying": "💥", "destroy_failed": "🟥"}.get(o.status, "⚪")
         line = (
             f"{idx}) {status_icon} <b>bot_{o.id}</b> — @{o.bot_username or '—'}\n"
             f"   └ وضعیت: {o.status} | داکر: <code>{state}</code>"
         )
         if o.expires_at:
             line += f" | انقضا: {o.expires_at.strftime('%Y/%m/%d')}"
-        if o.status == "failed":
+        if o.status in ("failed", "destroy_failed"):
             safe_reason = html.escape((o.fail_reason or '')[:100])
             line += f"\n   └ <code>{safe_reason}</code>"
             
@@ -501,7 +524,22 @@ async def cb_inst_page(cb: CallbackQuery):
 async def cb_inst_stop(cb: CallbackQuery):
     oid = int(cb.data.split(":")[2])
     from core.deploy_queue import DeployJob, deploy_queue
-    deploy_queue.submit(DeployJob(action="stop", order_id=oid))
+
+    # 🩹 FIX (S4): قبلاً جاب توقف بدون done_cb بود — شکست (تایم‌اوت، کانتینر
+    # لجباز) بی‌صدا می‌ماند و ادمین فکر می‌کرد توقف اعمال شده است.
+    async def _done(result: dict):
+        if result.get("ok"):
+            msg = f"⏸ <b>bot_{oid}</b> با موفقیت متوقف شد."
+        else:
+            err = html.escape(str(result.get("error") or "کانتینر پس از دستور توقف هنوز روشن است")[:400])
+            msg = (f"❌ توقف <b>bot_{oid}</b> کامل نشد:\n<code>{err}</code>\n\n"
+                   "دوباره توقف را بزنید یا لاگ داکر را بررسی کنید:")
+        try:
+            await cb.message.answer(msg)
+        except Exception:
+            pass
+
+    deploy_queue.submit(DeployJob(action="stop", order_id=oid, done_cb=_done))
     await cb.answer(f"bot_{oid} در صف توقف قرار گرفت")
 
 
@@ -509,7 +547,21 @@ async def cb_inst_stop(cb: CallbackQuery):
 async def cb_inst_start(cb: CallbackQuery):
     oid = int(cb.data.split(":")[2])
     from core.deploy_queue import DeployJob, deploy_queue
-    deploy_queue.submit(DeployJob(action="start", order_id=oid))
+
+    # 🩹 FIX (S4): همان بازخورد واقعی برای استارت
+    async def _done(result: dict):
+        if result.get("ok"):
+            msg = f"▶️ <b>bot_{oid}</b> با موفقیت روشن شد."
+        else:
+            err = html.escape(str(result.get("error") or "کانتینر پس از دستور استارت روشن نشد")[:400])
+            msg = (f"❌ روشن‌کردن <b>bot_{oid}</b> کامل نشد:\n<code>{err}</code>\n\n"
+                   "دوباره روشن را بزنید یا لاگ داکر را بررسی کنید:")
+        try:
+            await cb.message.answer(msg)
+        except Exception:
+            pass
+
+    deploy_queue.submit(DeployJob(action="start", order_id=oid, done_cb=_done))
     await cb.answer(f"bot_{oid} در صف روشن‌شدن قرار گرفت")
 
 
@@ -574,7 +626,24 @@ async def cb_inst_destroy(cb: CallbackQuery):
     
     if len(parts) == 4 and parts[3] == "yes":
         from core.deploy_queue import DeployJob, deploy_queue
-        deploy_queue.submit(DeployJob(action="destroy", order_id=oid))
+
+        # 🩹 FIX (S4/D2): جاب حذف هم بدون بازخورد بود — اگر صف پر بود یا جاب
+        # شکست می‌خورد، ادمین فکر می‌کرد حذف شده و توکن کاربر قفل می‌ماند.
+        async def _done(result: dict):
+            if result.get("ok"):
+                msg = (f"💥 <b>bot_{oid}</b> کاملاً حذف شد.\n"
+                       "کانتینر + پوشه + دیتابیس + اسلات redis آزاد شد — توکن قابل خرید مجدد است.")
+            else:
+                err = html.escape(str(result.get("error") or "خطای نامشخص")[:400])
+                msg = (f"🟥 حذف <b>bot_{oid}</b> ناقص ماند (destroy_failed):\n<code>{err}</code>\n\n"
+                       "دوباره «حذف مجدد» را بزنید — عملیات حذف تکرارپذیر/امن است.\n"
+                       "تا حذف کامل نشود، خرید مجدد با همان توکن فعال نخواهد بود.")
+            try:
+                await cb.message.answer(msg)
+            except Exception:
+                pass
+
+        deploy_queue.submit(DeployJob(action="destroy", order_id=oid, done_cb=_done))
         await cb.answer("💥 در صف حذف کامل قرار گرفت")
         try:
             await cb.message.edit_reply_markup(reply_markup=None)

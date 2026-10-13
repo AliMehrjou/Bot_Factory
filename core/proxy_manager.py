@@ -32,7 +32,8 @@ from config import config
 from database import async_session
 from database.engine import get_shared_app_engine, drop_instance_engine
 from database.models import FactoryProxy, InstanceProxy, Order, SyncLog
-from utils.proxy_parse import ParsedProxy, parse_proxies_text, mask_proxy, instance_db_key, all_instance_db_forms
+from utils.proxy_parse import (ParsedProxy, parse_proxies_text, mask_proxy,
+                              instance_db_key, all_instance_db_forms, build_proxy_url)
 
 logger = logging.getLogger(__name__)
 
@@ -239,6 +240,13 @@ async def edit_central_proxy(proxy_id: int, new_raw: str) -> dict:
         if old_string == p.proxy_string:
             return {"ok": False, "msg": "ℹ️ رشته جدید با مقدار فعلی یکسان است."}
 
+        # 🩹 FIX (PX-E): اینستنس‌های دارای تخصیصِ همین پروکسی را «قبل» از هر
+        # تغییری جمع می‌کنیم — بعد از ادغام/حذف، دیگر قابل بازیابی نیستند.
+        # این لیست برای سینک فوری بعد از غیرفعال‌سازی رشتهٔ قدیمی استفاده می‌شود.
+        affected_oids = set((await session.scalars(
+            select(InstanceProxy.order_id).where(InstanceProxy.proxy_id == old.id)
+        )).all())
+
         # اگر رشته جدید قبلاً در انبار هست → ادغام
         existing = (await session.scalars(
             select(FactoryProxy).where(FactoryProxy.proxy_string == p.proxy_string)
@@ -287,6 +295,24 @@ async def edit_central_proxy(proxy_id: int, new_raw: str) -> dict:
     # رشته قدیمی را در همه دیتابیس‌های اینستنس غیرفعال کن (جایگزین شده است)
     await _deactivate_in_all_instances([(old_string, old_scheme)])
 
+    # 🩹 FIX (PX-E): قبلاً رشتهٔ قدیمی «فوراً» در همه اینستنس‌ها خاموش می‌شد ولی
+    # رشتهٔ جدید فقط در سینکِ بعدِ check_cycle (که باید همهٔ استخر را تست کند)
+    # می‌نشست — برای اینستنسی که تنها پروکسی لاگینش همین بود، چند دقیقه پنجرهٔ
+    # بی‌پروکسی می‌ماند و لاگین‌ها مستقیم و بدون پروکسی می‌زدند.
+    # حالا همین اینستنس‌های متأثر بلافاصله سینک می‌شوند؛ رشتهٔ جدید (که در شاخهٔ
+    # درجا «active» شده) همان لحظه می‌نشیند و check_cycle در پس‌زمینه آن را
+    # اعتبارسنجی می‌کند. سینک‌های هم‌زمان پشت _sync_lock سریال می‌شوند (رفع P2).
+    if affected_oids:
+        async def _resync_affected():
+            for oid in sorted(affected_oids):
+                try:
+                    await sync_instance_now(int(oid))
+                except Exception as e:
+                    logger.warning("سینک فوری bot_%s پس از ویرایش پروکسی ناموفق: %s", oid, e)
+        t_resync = asyncio.create_task(_resync_affected())
+        _bg_tasks.add(t_resync)
+        t_resync.add_done_callback(_bg_tasks.discard)
+
     t = asyncio.create_task(check_cycle(force=True))
     _bg_tasks.add(t)
     t.add_done_callback(_bg_tasks.discard)
@@ -300,8 +326,9 @@ async def edit_central_proxy(proxy_id: int, new_raw: str) -> dict:
 # ------------------------------------------------------------
 async def _check_one(p: FactoryProxy) -> tuple:
     """اتصال از طریق پروکسی به DC تلگرام؛ خروجی (ok, latency_ms|None)."""
-    url = f"{p.scheme}://{p.username}:{p.password}@{p.host}:{p.port}" if p.username \
-        else f"{p.scheme}://{p.host}:{p.port}"
+    # 🩹 FIX (P4): URL با اعتبارنامهٔ URL-encode شده ساخته می‌شود — پسوردهای
+    # دارای @ : / # دیگر URL را خراب نمی‌کنند و پروکسی سالم «مرده» ثبت نمی‌شود.
+    url = build_proxy_url(p.scheme, p.host, p.port, p.username or "", p.password or "")
     start = time.monotonic()
     try:
         proxy = AsyncProxy.from_url(url)
@@ -580,10 +607,14 @@ async def sync_all_instances(reason: str = "") -> int:
     • درج/به‌روزرسانی: is_active=1, health_state=HEALTHY|WEAK, ping_ms
     • سطرهای ناموجود در desired (مرده/حذف‌شده/غیرتخصیصی): is_active=0, health_state=DEAD
     ⚠️ never DELETE — شمارنده in_use و fail_count اینستنس دست‌نخورده می‌ماند.
+    🩹 FIX (P2): قبلاً اگر سینک دیگری در جریان بود، درخواست جدید «نادیده گرفته می‌شد»
+      و 0 برمی‌گشت — دکمهٔ سینک دستی «سینک به 0 اینستنس انجام شد» جواب می‌داد و
+      خاموش‌کردن پروکسی مرده تا سیکل بعد (تا 180s) در اینستنس‌ها نمی‌نشست.
+      حالا درخواست جدید به‌جای رهاشدن، در صف قفل می‌ایستد و بلافاصله پس از سینک
+      در جریان، خودش کامل اجرا می‌شود (asyncio.Lock خودش FIFO ترتیب را حفظ می‌کند).
     """
     if _sync_lock.locked():
-        logger.warning("سینک در حال اجراست، درخواست جدید نادیده گرفته شد.")
-        return 0
+        logger.info("سینک دیگری در جریان است؛ درخواست جدید در صف سینک می‌ایستد و بلافاصله پس از آن اجرا می‌شود.")
     async with _sync_lock:
         from sqlalchemy import text
         async with async_session() as session:
@@ -856,8 +887,8 @@ async def get_best_proxy_url() -> str:
         )).first()
         if not p:
             return ""
-        return f"{p.scheme}://{p.username}:{p.password}@{p.host}:{p.port}" if p.username \
-            else f"{p.scheme}://{p.host}:{p.port}"
+        # 🩹 FIX (P4): URL امن با quote — برای LOGIN_PROXY_URL اینستنس جدید
+        return build_proxy_url(p.scheme, p.host, p.port, p.username or "", p.password or "")
 
 
 # ------------------------------------------------------------
@@ -938,8 +969,8 @@ async def export_text() -> str:
         return "(لیست خالی است)"
     lines = []
     for p in rows:
-        url = f"{p.scheme}://{p.username}:{p.password}@{p.host}:{p.port}" if p.username \
-            else f"{p.scheme}://{p.host}:{p.port}"
+        # 🩹 FIX (P4): خروجی بکاپ هم URL امن با quote (برای بازگردانی/انتقال سالم)
+        url = build_proxy_url(p.scheme, p.host, p.port, p.username or "", p.password or "")
         lines.append(f"{url}  # {p.status} {p.ping_ms or '-'}ms")
     return "\n".join(lines)
 

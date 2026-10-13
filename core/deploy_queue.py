@@ -20,7 +20,7 @@ from config import config
 from core import orchestrator
 from database import async_session
 from database.models import Order
-from sqlalchemy import text
+from sqlalchemy import text, select
 
 logger = logging.getLogger(__name__)
 
@@ -104,38 +104,84 @@ class DeployQueue:
             return await orchestrator.destroy(job.order_id)
 
         if job.action == "stop":
+            # وضعیت قبلی را نگه می‌داریم تا سفارش failed در اثر توقف به stopped تبدیل نشود
             async with async_session() as session:
+                prior_status = await session.scalar(
+                    select(Order.status).where(Order.id == job.order_id))
                 await session.execute(text("UPDATE orders SET status='stopping' WHERE id=:o"), {"o": job.order_id})
                 await session.commit()
+            stop_ok = True
             try:
                 await orchestrator.stop(job.order_id)
             except Exception as e:
+                stop_ok = False
                 logger.error("خطا در توقف bot_%s: %s", job.order_id, e)
-            
-            st = await orchestrator.status(job.order_id)
-            real_status = 'stopped' if not st.get("running") else 'deployed'
+
+            # 🩹 FIX (S3): status خودش روی تایم‌اوت/خطای داکر Exception می‌دهد —
+            # قبلاً این خط می‌توانست کل جاب را بپراند و وضعیت سفارش برای همیشه
+            # «stopping» بماند (خروج از لیست اینستنس‌ها). حالا محافظت‌شده است.
+            st = None
+            try:
+                st = await orchestrator.status(job.order_id)
+            except Exception as e:
+                logger.warning("بررسی وضعیت پس از توقف bot_%s ناموفق: %s", job.order_id, e)
+
+            if st is not None:
+                real_status = 'stopped' if not st.get("running") else 'deployed'
+            elif stop_ok:
+                # خود دستور stop موفق بود ولی inspect جواب نداد — متوقف فرض می‌کنیم
+                real_status = 'stopped'
+            else:
+                # نه stop موفق بود نه inspect — کانتینر به احتمال زیاد هنوز روشن است
+                real_status = 'deployed'
+
+            # 🩹 FIX (S3): سفارش failed (بدون compose) با توقف نباید «stopped» شود
+            if real_status == 'stopped' and prior_status == 'failed':
+                real_status = 'failed'
+
             async with async_session() as session:
                 await session.execute(text("UPDATE orders SET status=:s WHERE id=:o"),
                                       {"s": real_status, "o": job.order_id})
                 await session.commit()
-            return {"ok": real_status == 'stopped'}
+            return {"ok": real_status == 'stopped', "status": real_status}
 
         if job.action == "start":
             async with async_session() as session:
+                prior_status = await session.scalar(
+                    select(Order.status).where(Order.id == job.order_id))
                 await session.execute(text("UPDATE orders SET status='starting' WHERE id=:o"), {"o": job.order_id})
                 await session.commit()
+            start_ok = True
             try:
                 await orchestrator.start(job.order_id)
             except Exception as e:
+                start_ok = False
                 logger.error("خطا در استارت bot_%s: %s", job.order_id, e)
-                
-            st = await orchestrator.status(job.order_id)
-            real_status = 'deployed' if st.get("running") else 'stopped'
+
+            # 🩹 FIX (S3): همان محافظت برای استارت — خطای گذرای inspect دیگر
+            # وضعیت را قفل نمی‌کند و سفارش failed واقعی می‌ماند
+            st = None
+            try:
+                st = await orchestrator.status(job.order_id)
+            except Exception as e:
+                logger.warning("بررسی وضعیت پس از استارت bot_%s ناموفق: %s", job.order_id, e)
+
+            if st is not None:
+                real_status = 'deployed' if st.get("running") else 'stopped'
+            elif start_ok:
+                real_status = 'deployed'
+            else:
+                real_status = 'stopped'
+
+            # سفارش failed بدون compose واقعاً راه‌اندازی نمی‌شود — failed بماند
+            if real_status == 'stopped' and prior_status == 'failed':
+                real_status = 'failed'
+
             async with async_session() as session:
                 await session.execute(text("UPDATE orders SET status=:s WHERE id=:o"),
                                       {"s": real_status, "o": job.order_id})
                 await session.commit()
-            return {"ok": real_status == 'deployed'}
+            return {"ok": real_status == 'deployed', "status": real_status}
 
         # 🩹 FIX (رُل‌اوت): اعمال ایمیج جدید روی یک اینستنس موجود — قبلاً هیچ
         # مسیری (نه پنل، نه صف) کانتینر در حال اجرا را Recreate نمی‌کرد و تنها

@@ -32,7 +32,7 @@ from sqlalchemy import select, update, delete, func, text, case
 from config import config
 from database import async_session
 from database.models import FactoryProxy, InstanceProxy, Order
-from utils.proxy_parse import parse_proxies_text, parse_proxy_line, mask_proxy, instance_db_key
+from utils.proxy_parse import parse_proxies_text, parse_proxy_line, mask_proxy, instance_db_key, build_proxy_url
 
 logger = logging.getLogger(__name__)
 
@@ -606,9 +606,11 @@ async def export_instance(order_id: int) -> str:
         return f"(bot_{order_id} هیچ تخصیص پروکسی ندارد)"
     lines = [f"# bot_{order_id} proxies  (format: scheme://user:pass@host:port  # type status ping)"]
     for ap, fp in rows:
-        url = fp.proxy_string if "@" in fp.proxy_string else fp.proxy_string
+        # 🩹 FIX (P4): خروجی بکاپ هم URL امن با quote — پسوردهای دارای @ : / #
+        # قبلاً خام چسبانده می‌شدند و خط خروجی برای بازگردانی/انتقال خراب بود.
+        url = build_proxy_url(fp.scheme, fp.host, fp.port, fp.username or "", fp.password or "")
         lines.append(
-            f"{fp.scheme}://{url}  # {ap.usage_type}{' on' if ap.enabled else ' off'}"
+            f"{url}  # {ap.usage_type}{' on' if ap.enabled else ' off'}"
             f" {fp.status} {fp.ping_ms or '-'}ms"
         )
     return "\n".join(lines)
