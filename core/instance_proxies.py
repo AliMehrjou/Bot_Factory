@@ -131,7 +131,7 @@ async def assign_text_to_instance(order_id: int, raw_text: str, usage_type: str)
             return {"ok": False, "msg": "اینستنس یافت نشد یا فعال نیست."}
 
         for p in parsed:
-            # ۱) انبار مرکزی (بدون تکرار)
+            # ۱) انبار مرکزی (بدون تکرار + احیای پروکسی dead در صورت ارسال مجدد)
             fp = (await session.scalars(
                 select(FactoryProxy).where(FactoryProxy.proxy_string == p.proxy_string)
             )).first()
@@ -144,6 +144,11 @@ async def assign_text_to_instance(order_id: int, raw_text: str, usage_type: str)
                 session.add(fp)
                 await session.flush()
                 pool_new += 1
+            elif fp.status in ("dead", "disabled"):
+                fp.status = "active"
+                fp.consec_fail = 0
+                fp.consec_ok = 0
+                fp.last_synced_at = None
 
             # ۲) تخصیص به اینستنس
             exist = (await session.scalars(

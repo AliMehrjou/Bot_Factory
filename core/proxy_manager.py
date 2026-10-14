@@ -84,21 +84,40 @@ async def add_proxies_from_text(text: str) -> dict:
         return {"added": 0, "duplicate": 0, "invalid": 0, "msg": "هیچ خط قابل شناسایی نبود."}
 
     async with async_session() as session:
-        existing = set(
-            (await session.scalars(select(FactoryProxy.proxy_string))).all()
-        )
+        existing_rows = (await session.scalars(select(FactoryProxy))).all()
+        existing_map = {r.proxy_string: r for r in existing_rows}
         added = 0
+        reactivated = 0
         for p in parsed:
-            if p.proxy_string in existing:
+            if p.proxy_string in existing_map:
+                fp = existing_map[p.proxy_string]
+                if fp.status in ("dead", "disabled"):
+                    fp.status = "active"
+                    fp.consec_fail = 0
+                    fp.consec_ok = 0
+                    fp.last_synced_at = None
+                    reactivated += 1
                 continue
-            session.add(FactoryProxy(
+            new_fp = FactoryProxy(
                 scheme=p.scheme, host=p.host, port=p.port,
                 username=p.username, password=p.password,
                 proxy_string=p.proxy_string, status="active",
-            ))
-            existing.add(p.proxy_string)
+            )
+            session.add(new_fp)
+            existing_map[p.proxy_string] = new_fp
             added += 1
         await session.commit()
+
+    return {
+        "added": added + reactivated,
+        "duplicate": len(parsed) - added,
+        "invalid": len(invalid),
+        "invalid_lines": invalid[:5],
+        "msg": f"✅ {added} پروکسی جدید ثبت شد"
+               f" | ♻️ احیا شده: {reactivated}"
+               f" | تکراری: {len(parsed) - added - reactivated}"
+               f" | نامعتبر: {len(invalid)}",
+    }
 
     return {
         "added": added,
@@ -347,26 +366,15 @@ async def _check_one(p: FactoryProxy) -> tuple:
 
 
 async def apply_manual_check_result(proxy_id: int, ok: bool, latency) -> tuple:
-    """
-    🩹 FIX (B4): اعمال نتیجه تستِ «دستی» ادمین با احترام به ماشین وضعیت.
-    قبلاً تست پنل نتیجه یک اتصال را مستقیم روی FactoryProxy.status می‌نوشت؛
-    یعنی یک timeout لحظه‌ای (شلوغی شبکه) پروکسی را فوراً «dead» می‌کرد و
-    همان پروکسی در همه اینستنس‌ها غیرفعال می‌شد — تستِ تشخیصی عملاً «قطع‌کن» بود.
-    حالا شمارنده‌ها همان قواعد check_cycle را دنبال می‌کنند:
-      • موفقیت  → consec_ok+1 / consec_fail=0 (بازیابی از dead پس از PROXY_RECOVER_OKS موفقیت پیاپی)
-      • شکست    → consec_fail+1 / consec_ok=0 (dead فقط پس از PROXY_DEAD_FAILS شکست پیاپی)
-    خروجی: (new_status, ping_ms, transitioned) — transitioned=True اگر وضعیت عوض شد.
-    """
     async with async_session() as session:
         p = await session.get(FactoryProxy, int(proxy_id))
         if not p:
             return None, None, False
         old = p.status
         if ok:
+            # در تست دستی ادمین، به محض موفقیت، پروکسی فوراً از DEAD خارج و فعال می‌شود
             new = "weak" if (latency or 0) > config.PROXY_WEAK_MS else "active"
-            if old == "dead" and (int(p.consec_ok or 0) + 1) < config.PROXY_RECOVER_OKS:
-                new = "dead"
-            p.consec_ok = int(p.consec_ok or 0) + 1
+            p.consec_ok = max(int(p.consec_ok or 0) + 1, config.PROXY_RECOVER_OKS)
             p.consec_fail = 0
         else:
             latency = None
@@ -443,9 +451,9 @@ async def check_cycle(force: bool = False) -> dict:
 
                 if ok:
                     new = "weak" if (latency or 0) > config.PROXY_WEAK_MS else "active"
-                    if old == "dead" and (new_consec_ok + 1) < config.PROXY_RECOVER_OKS:
+                    if not force and old == "dead" and (new_consec_ok + 1) < config.PROXY_RECOVER_OKS:
                         new = "dead"
-                    new_consec_ok += 1
+                    new_consec_ok = max(new_consec_ok + 1, config.PROXY_RECOVER_OKS if force else 0)
                     new_consec_fail = 0
                 else:
                     new_consec_ok = 0
@@ -469,9 +477,9 @@ async def check_cycle(force: bool = False) -> dict:
                 )
             await session.commit()
 
-        # سینک در صورت تغییر وضعیت، وجود پروکسی جدید، یا سیکل‌های ۵
+        # سینک در صورت تغییر وضعیت، وجود پروکسی جدید، تست دستی (force) یا سیکل‌های ۵
         synced = 0
-        if transitions or needs_sync or _cycle_count % 5 == 0:
+        if force or transitions or needs_sync or _cycle_count % 5 == 0:
             synced = await sync_all_instances()
 
         # اعلان ادمین (آگاه از اینستنس‌های متأثر — برای پروکسی‌های تخصیص‌یافته)
@@ -483,7 +491,7 @@ async def check_cycle(force: bool = False) -> dict:
                     .join(FactoryProxy, FactoryProxy.id == InstanceProxy.proxy_id)
                     .join(Order, Order.id == InstanceProxy.order_id)
                     .where(InstanceProxy.enabled == True,
-                           Order.status.in_("deployed", "stopped"))
+                           Order.status.in_(("deployed", "stopped")))
                 )).all()
             usage_map = {}
             for ap, fp, o in usage_rows:
