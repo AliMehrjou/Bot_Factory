@@ -52,7 +52,15 @@ _bg_tasks = set()
 
 async def on_startup(bot: Bot):
     await init_db()
-    
+
+    # 🩹 v4.3: رفع خودکار دسترسی DELETE کاربر factory_app روی اینستنس‌های موجود —
+    # اینستنس‌های ساخته‌شده با نسخه‌های قدیمی DELETE ندارند و کل سینکشان با
+    # (1142, DELETE command denied) abort می‌شد. idempotent است.
+    try:
+        await proxy_manager.ensure_app_user_grants()
+    except Exception as e:
+        logger.warning("ensure_app_user_grants (استارتاپ) ناموفق: %s", e)
+
     proxy_manager.set_notifier(notify_admins)
     health_monitor.set_notifier(notify_admins)
     from core import instance_proxies

@@ -190,6 +190,64 @@ async def _remove_from_all_instances(items: list) -> int:
     return done
 
 
+async def ensure_app_user_grants() -> int:
+    """
+    🩹 v4.3 — اعطای خودکار دسترسی کامل سینک (SELECT/INSERT/UPDATE/DELETE) به کاربر
+    اپلیکیشن فکتوری روی دیتابیس همه اینستنس‌های زنده (deployed/stopped).
+
+    چرا؟ ensure_database در نسخه‌های قدیمی فقط «SELECT, INSERT, UPDATE» به
+    factory_app می‌داد؛ از v4.1 که حذفِ ادمین واقعاً DELETE می‌زند، هر سینک چنین
+    اینستنسی با (1142, "DELETE command denied to user 'factory_app'") کل فرآیند
+    را abort می‌کند ← هیچ تغییری (نه حذف، نه به‌روزرسانی) به ربات مشتری نمی‌رسد
+    و ردیفِ حذف‌شدهٔ ادمین ساعت‌ها در لاگینِ مشتری می‌ماند.
+
+    idempotent است؛ در استارتاپ (main.on_startup) و هنگام خطای دسترسی در
+    _sync_one_instance به‌طور خودکار اجرا می‌شود.
+    عدد برگشتی = تعداد دیتابیس‌هایی که GRANT شدند؛ -1 یعنی اتصال root برقرار نشد.
+    """
+    from sqlalchemy import text as _text
+    from database.engine import get_root_engine
+
+    try:
+        async with async_session() as session:
+            orders = (await session.scalars(
+                select(Order.id).where(Order.status.in_(("deployed", "stopped")))
+            )).all()
+    except Exception as e:
+        logger.error("ensure_app_user_grants: خواندن لیست اینستنس‌ها ناموفق: %s", e)
+        return -1
+
+    try:
+        eng = get_root_engine()
+    except Exception as e:
+        logger.error("ensure_app_user_grants: ساخت انجین root ناموفق: %s", e)
+        return -1
+
+    done = 0
+    try:
+        async with eng.begin() as conn:
+            for oid in orders:
+                db_name = config.db_name_for(int(oid))
+                try:
+                    await conn.execute(_text(
+                        f"GRANT SELECT, INSERT, UPDATE, DELETE ON `{db_name}`.* "
+                        f"TO '{config.FACTORY_APP_USER}'@'%'"
+                    ))
+                    done += 1
+                except Exception as e:
+                    logger.warning("ensure_app_user_grants: GRANT روی %s ناموفق: %s", db_name, e)
+            try:
+                await conn.execute(_text("FLUSH PRIVILEGES"))
+            except Exception:
+                pass
+    except Exception as e:
+        logger.error("ensure_app_user_grants: اجرای GRANTها ناموفق: %s", e)
+        return -1
+    if done:
+        logger.info("🛡 دسترسی سینکِ factory_app روی %s اینستنس تازه/تأیید شد", done)
+    return done
+
+
 async def remove_proxy(proxy_id: int) -> bool:
     """
     حذف کامل پروکسی از استخر مرکزی + پاکسازی تخصیص‌ها + غیرفعال‌سازی در
@@ -802,6 +860,30 @@ async def sync_instance_now(order_id: int) -> int:
             return -1
 
 async def _sync_one_instance(order_id: int, desired: dict) -> None:
+    """
+    🩹 v4.3 — wrapper خودترمیمِ دسترسی: اگر سینک به‌خاطر نبودِ PRIVILEGE شکست بخورد
+    (مثل 1142 «DELETE command denied to user 'factory_app'»)، دسترسی‌ها با اتصال
+    root تازه داده می‌شوند و همان سینک بلافاصله یک‌بار دیگر اجرا می‌شود. علت:
+    اینستنس‌هایی که با نسخه‌های قدیمیِ ensure_database ساخته شده‌اند DELETE ندارند
+    و بدون این wrapper حذفِ قطعیِ ادمین هرگز به ربات مشتری propagate نمی‌شد.
+    """
+    try:
+        await _sync_one_instance_once(order_id, desired)
+    except Exception as e:
+        if "command denied" not in str(e).lower():
+            raise
+        logger.warning(
+            "سینک bot_%s با خطای دسترسی MySQL شکست خورد — تلاش برای رفع خودکار GRANT... (%s)",
+            order_id, e,
+        )
+        fixed = await ensure_app_user_grants()
+        if fixed <= 0:
+            raise
+        logger.info("🛡 دسترسی‌ها تازه شد؛ سینک bot_%s دوباره اجرا می‌شود", order_id)
+        await _sync_one_instance_once(order_id, desired)
+
+
+async def _sync_one_instance_once(order_id: int, desired: dict) -> None:
     db_name = config.db_name_for(order_id)
     from database.engine import get_shared_app_engine
     eng = get_shared_app_engine()

@@ -234,8 +234,9 @@ async def ensure_database(order_id: int, db_user: str, db_pass: str) -> None:
         f"CREATE USER IF NOT EXISTS '{db_user}'@'%' IDENTIFIED BY '{db_pass}'",
         f"ALTER USER '{db_user}'@'%' IDENTIFIED BY '{db_pass}'",
         f"GRANT ALL PRIVILEGES ON `{db_name}`.* TO '{db_user}'@'%'",
-        # فکتوری برای سینک پروکسی فقط به عملیات پایه روی دیتابیس مشتری نیاز نیاز دارد
-        f"GRANT SELECT, INSERT, UPDATE ON `{db_name}`.* TO '{config.FACTORY_APP_USER}'@'%'",
+        # 🩹 v4.3: فکتوری برای سینک پروکسی + «حذف قطعیِ» v4.1+ به DELETE هم نیاز دارد؛
+        # GRANT قدیمی فقط SELECT/INSERT/UPDATE بود ← (1142, DELETE command denied)
+        f"GRANT SELECT, INSERT, UPDATE, DELETE ON `{db_name}`.* TO '{config.FACTORY_APP_USER}'@'%'",
         "FLUSH PRIVILEGES"
     ]
     async with engine.connect() as conn:

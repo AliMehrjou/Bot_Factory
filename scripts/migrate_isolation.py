@@ -55,7 +55,7 @@ async def run(dry_run=True):
         stmts = [
             f"CREATE USER IF NOT EXISTS '{db_user}'@'%' IDENTIFIED BY '{db_pass}'",
             f"GRANT ALL PRIVILEGES ON `{db_name}`.* TO '{db_user}'@'%'",
-            f"GRANT SELECT, INSERT, UPDATE ON `{db_name}`.* TO '{config.FACTORY_APP_USER}'@'%'",
+            f"GRANT SELECT, INSERT, UPDATE, DELETE ON `{db_name}`.* TO '{config.FACTORY_APP_USER}'@'%'",
             "FLUSH PRIVILEGES"
         ]
         
