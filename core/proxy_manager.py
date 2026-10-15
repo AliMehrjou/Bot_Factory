@@ -132,15 +132,10 @@ async def add_proxies_from_text(text: str) -> dict:
 
 _bg_tasks = set()
 
-
 async def _deactivate_in_all_instances(items: list) -> int:
     """
     🛠 رفع باگ مهم نسخه قبل: وقتی پروکسی از استخر مرکزی حذف می‌شد، ردیف فعالش
-    در دیتابیس اینستنس‌ها باقی می‌ماند (چون دیگر member «known_to_factory» نبود و
-    سینک آن را deactive نمی‌کرد). حالا قبل از حذف، رشته در «همه» دیتابیس‌های
-    اینستنس‌های فعال/متوقف غیرفعال می‌شود تا لاگین/سندر روی آن ننشیند.
-    🩹 FIX (B3): items = [(proxy_string, scheme), ...] — هر دو فرم خام (legacy)
-    و دارای پیشوندِ scheme غیرفعال می‌شوند تا ردیف‌های با فرمت جدید هم قطع شوند.
+    در دیتابیس اینستنس‌ها باقی می‌ماند...
     """
     if not items:
         return 0
@@ -164,6 +159,17 @@ async def _deactivate_in_all_instances(items: list) -> int:
         db_name = config.db_name_for(int(oid))
         try:
             async with eng.begin() as conn:
+                # 🛠 اصلاح: ابتدا اکانت‌های متصل به این پروکسی‌ها را آزاد کن و به صف انتظار بفرست
+                await conn.execute(
+                    _text(
+                        f"UPDATE `{db_name}`.`accounts` "
+                        "SET proxy_string=NULL, proxy_status='WAITING_PROXY', proxy_queue_joined_at=NOW() "
+                        "WHERE proxy_string IN :ps"
+                    ).bindparams(bindparam("ps", expanding=True)),
+                    {"ps": list(forms)},
+                )
+                
+                # غیرفعال کردن خود پروکسی در دیتابیس ربات
                 await conn.execute(
                     _text(
                         f"UPDATE `{db_name}`.`proxies` "
@@ -596,7 +602,9 @@ async def _resolve_desired(order_id: int, healthy_rows: list) -> dict:
         )).all()
     if rows:
         return _desired_from_assignments(rows)
-    return {}
+        
+    # 🛠 اصلاح: اگر اینستنس هیچ تخصیصی نداشت، به استخر عمومی (Legacy) برگردد
+    return _desired_for_instance(order_id, healthy_rows)
 
 # ------------------------------------------------------------
 # سینک به اینستنس‌ها (قسمت لاگین + سندر)
