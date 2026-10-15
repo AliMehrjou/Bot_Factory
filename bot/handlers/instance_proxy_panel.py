@@ -63,17 +63,24 @@ async def _safe_edit(cb: CallbackQuery, text: str, kb=None):
 async def _menu_text(order: Order) -> str:
     st = await ipx.instance_stats(order.id)
     L, S, B = st["login"], st["sender"], st["both"]
-    mode_line = (
-        "🎯 <b>حالت: تخصیص اختصاصی</b> (فقط پروکسی‌های زیر به این ربات سینک می‌شود)"
-        if st["mode"] == "per-instance" else
-        "♻️ <b>حالت: عمومی (legacy)</b> — هنوز تخصیص اختصاصی ثبت نشده؛ اینستنس از چرخش "
-        "عمومی استخر سالم استفاده می‌کند. با «➕ افزودن» یا «🎯 تخصیص از استخر» این حالت "
-        "به اختصاصی تغییر می‌کند."
-    )
+    if st["mode"] == "per-instance":
+        mode_line = (
+            "🎯 <b>حالت: اختصاصی — خالی</b>\n"
+            "اینستنس عمداً بدون پروکسی است (حذف ادمین قطعی است و از استخر عمومی هم"
+            " چیزی به آن برنمی‌گردد). از «➕ افزودن» یا «🎯 تخصیص از استخر» پروکسی جدید بدهید."
+            if st["total"] == 0 else
+            "🎯 <b>حالت: تخصیص اختصاصی</b> (فقط پروکسی‌های زیر به این ربات سینک می‌شود)"
+        )
+    else:
+        mode_line = (
+            "♻️ <b>حالت: عمومی (legacy)</b> — هنوز تخصیص اختصاصی ثبت نشده؛ اینستنس از چرخش "
+            "عمومی استخر سالم استفاده می‌کند. با «➕ افزودن» یا «🎯 تخصیص از استخر» این حالت "
+            "به اختصاصی تغییر می‌کند."
+        )
     warn = ""
     healthy_login = L["healthy"] + B["healthy"]
     healthy_sender = S["healthy"] + B["healthy"]
-    if st["mode"] == "per-instance" and (
+    if st["mode"] == "per-instance" and st["total"] > 0 and (
             healthy_login < config.INSTANCE_PROXY_MIN_HEALTHY
             or healthy_sender < config.INSTANCE_PROXY_MIN_HEALTHY):
         warn = (f"\n\n⚠️ <b>هشدار کمبود:</b> سهمیه سالم کم است "
@@ -360,16 +367,18 @@ async def cb_rmask(cb: CallbackQuery):
     parts = cb.data.split(":")
     oid, apid = int(parts[2]), int(parts[3])
     if len(parts) == 5 and parts[4] == "yes":
+        # سینکِ حذفِ قطعی داخل unassign به‌صورت await اجرا می‌شود؛ cb را زود جواب می‌دهیم
+        await cb.answer("🗑 در حال حذف قطعی و سینک…")
         result = await ipx.unassign(apid)
-        await cb.answer("🗑 حذف شد" if result["ok"] else "❌ خطا")
         order = await _get_order(oid)
         return await _safe_edit(cb, result["msg"] + "\n\n" + await _menu_text(order),
                                 instance_proxy_menu_kb(oid))
     await cb.answer()
     await _safe_edit(
         cb, f"⚠️ حذف تخصیص #{apid} از bot_{oid}؟\n\n"
-            "پروکسی از این اینستنس خارج می‌شود (در استخر مرکزی باقی می‌ماند و اگر "
-            "اینستنس دیگری آن را داشته باشد دست نمی‌خورد).",
+            "پروکسی از این اینستنس «قطعاً» خارج می‌شود — ردیف آن از دیتابیس ربات مشتری "
+            "پاک می‌گردد و اکانت‌های متصل به صف انتظار می‌روند (در استخر مرکزی باقی "
+            "می‌ماند و اگر اینستنس دیگری آن را داشته باشد دست نمی‌خورد).",
         confirm_instance_rm_kb(oid, apid))
 
 
@@ -381,18 +390,22 @@ async def cb_rmall(cb: CallbackQuery):
     parts = cb.data.split(":")
     oid = int(parts[2])
     if len(parts) == 4 and parts[3] == "yes":
+        # سینکِ حذفِ قطعی داخل unassign_all به‌صورت await اجرا می‌شود؛ cb را زود جواب می‌دهیم
+        await cb.answer("🗑 در حال حذف قطعی و سینک…")
         result = await ipx.unassign_all(oid, only_dead=False)
-        await cb.answer()
         order = await _get_order(oid)
-        warn = ("\n\n♻️ اینستنس به حالت legacy (چرخش عمومی استخر) برگشت."
+        warn = ("\n\n🎯 اینستنس در حالت «اختصاصیِ خالی» قفل شد — ردیف‌های پروکسی از دیتابیس "
+                "ربات مشتری حذف شدند و تا افزودن پروکسی جدید، هیچ پروکسی‌ای (حتی از استخر "
+                "عمومی) به آن سینک نمی‌شود."
                 if order else "")
         return await _safe_edit(cb, result["msg"] + warn + "\n\n" + await _menu_text(order),
                                 instance_proxy_menu_kb(oid))
     await cb.answer()
     await _safe_edit(
         cb, f"💥 <b>حذف همه تخصیص‌های bot_{oid}؟</b>\n\n"
-            "همه پروکسی‌ها از این اینستنس خارج می‌شوند و اینستنس به حالت legacy "
-            "(چرخش عمومی استخر سالم) برمی‌گردد. این عمل قابل بازگشت نیست (تخصیص‌ها "
+            "همه پروکسی‌ها به‌صورت «قطعی» از دیتابیس این ربات مشتری حذف می‌شوند (اکانت‌های "
+            "متصل به صف انتظار می‌روند) و اینستنس تا افزودن پروکسی جدید، بدون پروکسی "
+            "می‌ماند — به استخر عمومی برنمی‌گردد. این عمل قابل بازگشت نیست (تخصیص‌ها "
             "باید دوباره ساخته شوند).",
         confirm_instance_rmall_kb(oid, only_dead=False))
 
@@ -402,15 +415,18 @@ async def cb_rmdead(cb: CallbackQuery):
     parts = cb.data.split(":")
     oid = int(parts[2])
     if len(parts) == 4 and parts[3] == "yes":
+        # سینکِ حذفِ قطعی داخل unassign_all به‌صورت await اجرا می‌شود؛ cb را زود جواب می‌دهیم
+        await cb.answer("🧹 در حال حذف قطعی و سینک…")
         result = await ipx.unassign_all(oid, only_dead=True)
-        await cb.answer()
         order = await _get_order(oid)
         return await _safe_edit(cb, result["msg"] + "\n\n" + await _menu_text(order),
                                 instance_proxy_menu_kb(oid))
     await cb.answer()
     await _safe_edit(
         cb, f"🧹 حذف تخصیص‌های «مرده» از bot_{oid}؟\n\n"
-            "فقط تخصیص‌هایی که پروکسی‌شان DEAD شده حذف می‌شوند تا لیست تمیز بماند.",
+            "فقط تخصیص‌هایی که پروکسی‌شان DEAD شده حذف می‌شوند — ردیف‌شان از دیتابیس "
+            "ربات مشتری هم پاک می‌شود تا لیست تمیز بماند (اگر پروکسی بعداً سلامت برگرداند "
+            "و همچنان تخصیص‌پذیر باشد، سینک بعدی دوباره می‌نشیند).",
         confirm_instance_rmall_kb(oid, only_dead=True))
 
 

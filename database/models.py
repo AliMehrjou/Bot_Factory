@@ -57,6 +57,13 @@ class Order(Base):
     # وضعیت
     status: Mapped[str] = mapped_column(String(24), default="awaiting_approval", index=True)
     fail_reason: Mapped[str] = mapped_column(Text, default="")
+
+    # 🩹 FIX (hard-delete): حالت مدیریت پروکسی اینستنس
+    #   legacy       → اینستنس هیچ‌وقت از پنل «پروکسی اینستنس‌ها» مدیریت نشده (چرخش عمومی استخر)
+    #   per-instance → ادمین حداقل یک‌بار تخصیص داده/حذف کرده؛ حتی اگر همه تخصیص‌ها
+    #                  حذف شود، اینستنس به legacy برنمی‌گردد و استخرش «خالی» می‌ماند
+    #                  (تا ادمین دوباره پروکسی اضافه کند) — ردیف حذف‌شده دیگر زنده نمی‌شود.
+    proxy_mode: Mapped[str] = mapped_column(String(20), default="legacy", server_default="'legacy'", nullable=False, index=True)
     approved_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     warned_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     renew_of: Mapped[int | None] = mapped_column(Integer, nullable=True)

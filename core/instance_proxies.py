@@ -130,6 +130,10 @@ async def assign_text_to_instance(order_id: int, raw_text: str, usage_type: str)
         if not order or order.status not in ("deployed", "stopped", "provisioning"):
             return {"ok": False, "msg": "اینستنس یافت نشد یا فعال نیست."}
 
+        # 🩹 FIX (hard-delete): هر عملیات تخصیص ادمین، اینستنس را در حالت اختصاصی
+        # قفل می‌کند تا بعداً حذفِ همه تخصیص‌ها به چرخش legacy برنگردد.
+        order.proxy_mode = "per-instance"
+
         for p in parsed:
             # ۱) انبار مرکزی (بدون تکرار + احیای پروکسی dead در صورت ارسال مجدد)
             fp = (await session.scalars(
@@ -218,6 +222,9 @@ async def assign_from_pool(order_id: int, count: int, usage_type: str) -> dict:
         order = await session.get(Order, order_id)
         if not order or order.status not in ("deployed", "stopped", "provisioning"):
             return {"ok": False, "msg": "اینستنس یافت نشد یا فعال نیست."}
+
+        # 🩹 FIX (hard-delete): حالت اختصاصی قفل می‌شود (شرح در assign_text_to_instance)
+        order.proxy_mode = "per-instance"
 
         # پروکسی‌های سالم استخر + تعداد تخصیص فعلی هرکدام (توزیع بار)
         load_sub = (
@@ -344,29 +351,48 @@ async def auto_assign_for_new_instance(order_id: int) -> dict:
 # حذف / خاموش‌و‌روشن / تغییر نوع
 # ============================================================
 async def unassign(assignment_id: int, resync: bool = True) -> dict:
-    """حذف تخصیص یک پروکسی از یک اینستنس (پروکسی در استخر مرکزی می‌ماند)."""
+    """
+    🩹 FIX (hard-delete): حذف تخصیص یک پروکسی از یک اینستنس — ردیف پروکسی از
+    جدول proxies دیتابیس خود ربات مشتری هم «واقعاً DELETE» می‌شود (نه فقط غیرفعال).
+    اکانت‌های متصل به آن آزاد و به صف انتظار می‌روند تا با پروکسی جدید که ادمین
+    اضافه می‌کند دوباره claim شوند. سینک به‌صورت await اجرا می‌شود تا پیام ادمین
+    صادقانه باشد (قبلاً «حذف شد» نمایش داده می‌شد حتی اگر سینک شکست می‌خورد).
+    """
     async with async_session() as session:
         ap = await session.get(InstanceProxy, int(assignment_id))
         if not ap:
             return {"ok": False, "msg": "تخصیص یافت نشد."}
         order_id, proxy_id, utype = ap.order_id, ap.proxy_id, ap.usage_type
         await session.delete(ap)
+        # حالت اختصاصی قفل می‌شود تا سینک، اینستنس را به استخر عمومی legacy برنگرداند
+        order = await session.get(Order, order_id)
+        if order:
+            order.proxy_mode = "per-instance"
         await session.commit()
 
+    sync_note = ""
     if resync:
-        async def _post():
-            try:
-                from core.proxy_manager import sync_instance_now
-                await sync_instance_now(order_id)
-            except Exception:
-                logger.exception("سینک پس از حذف تخصیص ناموفق")
-        _spawn(_post())
-    return {"ok": True, "msg": f"🗑 تخصیص #{assignment_id} ({TYPE_LABEL[utype]}) از bot_{order_id} حذف شد.",
+        try:
+            from core.proxy_manager import sync_instance_now
+            n = await sync_instance_now(order_id)
+            if n < 0:
+                sync_note = "\n⚠️ سینک به دیتابیس ربات ناموفق بود؛ ردیف در سیکل بعد پاک می‌شود."
+        except Exception:
+            logger.exception("سینک پس از حذف تخصیص ناموفق")
+            sync_note = "\n⚠️ سینک به دیتابیس ربات ناموفق بود؛ ردیف در سیکل بعد پاک می‌شود."
+    return {"ok": True,
+            "msg": f"🗑 تخصیص #{assignment_id} ({TYPE_LABEL[utype]}) از bot_{order_id} حذف شد و "
+                   f"ردیف پروکسی از دیتابیس ربات مشتری پاک گردید.{sync_note}",
             "order_id": order_id}
 
 
 async def unassign_all(order_id: int, only_dead: bool = False) -> dict:
-    """حذف همه تخصیص‌های یک اینستنس (یا فقط تخصیص‌های پروکسی مرده)."""
+    """
+    🩹 FIX (hard-delete): حذف همه تخصیص‌های یک اینستنس (یا فقط مرده‌ها).
+    اینستنس در حالت «اختصاصیِ خالی» قفل می‌شود — یعنی تا وقتی ادمین دوباره پروکسی
+    اضافه نکند، هیچ پروکسی‌ای (حتی از استخر عمومی) به ربات مشتری سینک نمی‌شود.
+    ردیف‌های قبلی از دیتابیس ربات مشتری واقعاً DELETE می‌شوند.
+    """
     order_id = int(order_id)
     async with async_session() as session:
         q = select(InstanceProxy).where(InstanceProxy.order_id == order_id)
@@ -376,19 +402,24 @@ async def unassign_all(order_id: int, only_dead: bool = False) -> dict:
         rows = (await session.scalars(q)).all()
         for ap in rows:
             await session.delete(ap)
+        # حالت اختصاصی قفل می‌شود (بدون fallback به legacy)
+        order = await session.get(Order, order_id)
+        if order:
+            order.proxy_mode = "per-instance"
         await session.commit()
         n = len(rows)
 
-    if n:
-        async def _post():
-            try:
-                from core.proxy_manager import sync_instance_now
-                await sync_instance_now(order_id)
-            except Exception:
-                logger.exception("سینک پس از حذف گروهی ناموفق")
-        _spawn(_post())
-    return {"ok": True, "msg": f"🗑 {n} تخصیص از bot_{order_id} حذف شد." +
-            (" (فقط مرده‌ها)" if only_dead else "")}
+    sync_note = ""
+    try:
+        from core.proxy_manager import sync_instance_now
+        m = await sync_instance_now(order_id)
+        if m < 0:
+            sync_note = "\n⚠️ سینک به دیتابیس ربات ناموفق بود؛ ردیف‌ها در سیکل بعد پاک می‌شوند."
+    except Exception:
+        logger.exception("سینک پس از حذف گروهی ناموفق")
+        sync_note = "\n⚠️ سینک به دیتابیس ربات ناموفق بود؛ ردیف‌ها در سیکل بعد پاک می‌شوند."
+    return {"ok": True, "msg": f"🗑 {n} تخصیص از bot_{order_id} حذف شد و ردیف‌هایشان از "
+            f"دیتابیس ربات مشتری پاک گردید." + (" (فقط مرده‌ها)" if only_dead else "") + sync_note}
 
 
 async def set_enabled(assignment_id: int, enabled: bool) -> dict:
@@ -539,6 +570,11 @@ async def instance_stats(order_id: int) -> dict:
                 out["dead_assignments"] += 1
     if out["total"] > 0:
         out["mode"] = "per-instance"
+    else:
+        # 🩹 FIX (hard-delete): اینستنسِ خالیِ مدیریت‌شده را از legacy تشخیص بده
+        async with async_session() as session:
+            order = await session.get(Order, order_id)
+        out["mode"] = (getattr(order, "proxy_mode", "legacy") if order else "legacy")
     return out
 
 

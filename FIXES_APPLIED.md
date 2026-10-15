@@ -10,6 +10,45 @@
 
 ---
 
+## 🗑 نسخه ۴.۱ — حذف قطعی پروکسی از اینستنس (hard-delete)
+
+**مشکل کارفرما:** «پروکسی را از طریق ربات‌ساز از اینستنس حذف می‌کنم ولی کاربر هنوز
+می‌تواند با همان پروکسی لاگین بزند (هرچند لاگین نمی‌شود).»
+
+**ریشه‌ها (هر سه با هم):**
+1. حذف فقط soft بود (`is_active=0, health_state='DEAD'`) — ردیف در دیتابیس ربات
+   مشتری باقی می‌ماند.
+2. مونیتور سلامت خود سندربات (`check_all_proxies` هر ۶۰۰ ثانیه) ردیف‌های
+   `DEAD + consecutive_failures>0` را دوباره تست و بعد از ۲ موفقیت زنده می‌کرد.
+3. حذفِ آخرین تخصیص → fallback به حالت legacy → همان سینکِ «حذف»، پروکسیِ هنوز-سالمِ
+   استخر مرکزی را با `is_active=1` دوباره می‌نوشت!
+4. fallback لوگین به `LOGIN_PROXY_URL` (env) — پروکسیِ حذف‌شده هنوز آنجا بود.
+
+**رفع (فکتوری):**
+| تغییر | فایل |
+|---|---|
+| ستون جدید `orders.proxy_mode` (`legacy`/`per-instance`) + مایگریشن idempotent | `database/models.py`, `database/engine.py` |
+| سینک حالت اختصاصیِ خالی → desired خالی (بدون fallback به legacy) | `core/proxy_manager.py` (`_resolve_desired`) |
+| ردیف‌های خارج از desired → **DELETE واقعی** + آزادسازی اکانت‌ها | `core/proxy_manager.py` (`_sync_one_instance`) |
+| `_deactivate_in_all_instances` → `_remove_from_all_instances` (DELETE به‌جای UPDATE) برای حذف مرکزی/purge/ویرایش | `core/proxy_manager.py` |
+| گارد استخر خالی در `sync_instance_now` (همان `sync_all_instances`) — جلوگیری از پاک‌شدن تصادفی هنگام قطعی شبکه فکتوری | `core/proxy_manager.py` |
+| تخصیص/حذف ادمین → قفل `proxy_mode='per-instance'`؛ سینکِ حذف awaited (پیام ادمین صادقانه) | `core/instance_proxies.py` |
+| متن‌های پنل: «حالت اختصاصی — خالی»، تأییدیه‌های حذف قطعی | `bot/handlers/instance_proxy_panel.py` |
+
+**رفع (سندربات):**
+| تغییر | فایل |
+|---|---|
+| `LOGIN_PROXY_URL` قبل از fallback زنده تست می‌شود؛ پروکسیِ مرده/حذف‌شده دیگر به لاگین داده نمی‌شود | `bot/handlers/login_handlers.py` |
+| چرخش «واقعی» پروکسی در تلاش‌های مجدد فلوی سشن/فایل (پیام «چرخش IP» قبلاً دروغ می‌گفت) + اصلاح شرط retry فلوی شماره (`health_state != 'DEAD'` به‌جای `is_healthy`) | `bot/handlers/login_handlers.py` |
+| `check_proxy_health` با scheme واقعی (http/…) به‌جای socks5 هاردکد | `utils/health_checker.py` |
+
+**رفتار جدید:** حذف ادمین = ردیف از دیتابیس ربات مشتری پاک می‌شود، اکانت‌های متصل به
+صف `WAITING_PROXY` می‌روند، هیچ مسیری آن را زنده نمی‌کند، و اینستنس تا افزودن پروکسی
+جدید توسط ادمین، خالی می‌ماند (به استخر عمومی برنمی‌گردد). اینستنس‌های قدیمی که هرگز
+از پنل مدیریت نشده‌اند همچنان legacy کار می‌کنند (سازگاری کامل).
+
+---
+
 ## 🔴 بحرانی‌ها
 
 ### S2 — توقف اینستنس بعد از ری‌بوت سرور می‌شکست

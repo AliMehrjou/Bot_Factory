@@ -16,8 +16,10 @@
      هر اینستنس فقط پروکسی‌های «تخصیص‌یافته و روشن» خودش را — با usage_type مخصوص
      خودش (login/sender/both) — در جدول proxies دیتابیس خودش می‌گیرد.
      اینستنس بدون تخصیص → حالت legacy چرخش عمومی استخر سالم (سازگاری نسخه قبل).
-  ۳) سطرهای خارج از تخصیص/مرده → is_active=0 / health_state='DEAD'
-     (هرگز DELETE نمی‌کنیم — شمارنده in_use و fail_count اینستنس دست‌نخورده می‌ماند)
+  ۳) 🩹 سطرهای خارج از تخصیص/مرده/حذف‌شده → حذف واقعی (DELETE) + آزادسازی اکانت‌های متصل
+     (حذفِ ادمین باید «قطعی» باشد — ردیف ناموجود دیگر نه لاگین رویش می‌نشیند، نه
+     مونیتور سلامت سندرباتش را زنده می‌کند؛ پروکسی سالمِ هنوز-تخصیص‌یافته با
+     INSERT مجدد در سیکل بعد برمی‌گردد)
   ۴) اطلاع‌رسانی به ادمین در تغییر وضعیت‌ها (batch + نام اینستنس‌های متأثر).
 """
 import asyncio
@@ -132,10 +134,15 @@ async def add_proxies_from_text(text: str) -> dict:
 
 _bg_tasks = set()
 
-async def _deactivate_in_all_instances(items: list) -> int:
+async def _remove_from_all_instances(items: list) -> int:
     """
-    🛠 رفع باگ مهم نسخه قبل: وقتی پروکسی از استخر مرکزی حذف می‌شد، ردیف فعالش
-    در دیتابیس اینستنس‌ها باقی می‌ماند...
+    🩹 FIX (hard-delete): حذف «واقعی» ردیف پروکسی از دیتابیس همه اینستنس‌های زنده.
+    قبلاً فقط is_active=0/health_state='DEAD' می‌شد — اما مونیتور سلامت خود سندربات
+    (check_all_proxies هر ۶۰۰ ثانیه) ردیف‌های DEAD با consecutive_failures>0 را دوباره
+    تست می‌کرد و پس از ۲ موفقیت زنده می‌کرد؛ یعنی پروکسی‌ای که ادمین عمداً حذف
+    کرده بود، دوباره به استخر لاگین/سندر اینستنس برمی‌گشت.
+    حالا: اکانت‌های متصل آزاد و به صف انتظار می‌روند و ردیف DELETE می‌شود —
+    چیزی برای زنده‌شدن باقی نمی‌ماند.
     """
     if not items:
         return 0
@@ -159,7 +166,7 @@ async def _deactivate_in_all_instances(items: list) -> int:
         db_name = config.db_name_for(int(oid))
         try:
             async with eng.begin() as conn:
-                # 🛠 اصلاح: ابتدا اکانت‌های متصل به این پروکسی‌ها را آزاد کن و به صف انتظار بفرست
+                # 🛠 ابتدا اکانت‌های متصل به این پروکسی‌ها را آزاد کن و به صف انتظار بفرست
                 await conn.execute(
                     _text(
                         f"UPDATE `{db_name}`.`accounts` "
@@ -168,19 +175,18 @@ async def _deactivate_in_all_instances(items: list) -> int:
                     ).bindparams(bindparam("ps", expanding=True)),
                     {"ps": list(forms)},
                 )
-                
-                # غیرفعال کردن خود پروکسی در دیتابیس ربات
+
+                # 🩹 حذف قطعی ردیف پروکسی از دیتابیس ربات مشتری
                 await conn.execute(
                     _text(
-                        f"UPDATE `{db_name}`.`proxies` "
-                        "SET is_active=0, is_healthy=0, health_state='DEAD' "
+                        f"DELETE FROM `{db_name}`.`proxies` "
                         "WHERE proxy_string IN :ps"
                     ).bindparams(bindparam("ps", expanding=True)),
                     {"ps": list(forms)},
                 )
             done += 1
         except Exception as e:
-            logger.debug("غیرفعال‌سازی %s در %s ناموفق: %s", forms[:2], db_name, e)
+            logger.debug("حذف %s در %s ناموفق: %s", forms[:2], db_name, e)
     return done
 
 
@@ -201,15 +207,15 @@ async def remove_proxy(proxy_id: int) -> bool:
         await session.delete(p)
         await session.commit()
 
-    # ۲) غیرفعال‌سازی در دیتابیس همه اینستنس‌های زنده
-    n = await _deactivate_in_all_instances([(proxy_string, proxy_scheme)])
-    logger.info("🗑 پروکسی %s حذف شد (در %s دیتابیس اینستنس غیرفعال گردید)",
+    # ۲) حذف قطعی ردیف از دیتابیس همه اینستنس‌های زنده
+    n = await _remove_from_all_instances([(proxy_string, proxy_scheme)])
+    logger.info("🗑 پروکسی %s حذف شد (ردیفش از %s دیتابیس اینستنس پاک گردید)",
                 mask_proxy(proxy_string), n)
     return True
 
 
 async def purge_dead() -> int:
-    """حذف کامل پروکسی‌های مرده از فکتوری + غیرفعال‌سازی ردیف‌هایشان در اینستنس‌ها."""
+    """حذف کامل پروکسی‌های مرده از فکتوری + پاکسازی قطعی ردیف‌هایشان در اینستنس‌ها."""
     async with async_session() as session:
         dead_rows = (await session.scalars(
             select(FactoryProxy).where(FactoryProxy.status == "dead")
@@ -226,7 +232,7 @@ async def purge_dead() -> int:
         n = res.rowcount or 0
 
     if dead_items:
-        await _deactivate_in_all_instances(dead_items)
+        await _remove_from_all_instances(dead_items)
     return n
 
 
@@ -317,8 +323,8 @@ async def edit_central_proxy(proxy_id: int, new_raw: str) -> dict:
             old.last_synced_at = None
             await session.commit()
 
-    # رشته قدیمی را در همه دیتابیس‌های اینستنس غیرفعال کن (جایگزین شده است)
-    await _deactivate_in_all_instances([(old_string, old_scheme)])
+    # رشته قدیمی را در همه دیتابیس‌های اینستنس حذف کن (جایگزین شده است)
+    await _remove_from_all_instances([(old_string, old_scheme)])
 
     # 🩹 FIX (PX-E): قبلاً رشتهٔ قدیمی «فوراً» در همه اینستنس‌ها خاموش می‌شد ولی
     # رشتهٔ جدید فقط در سینکِ بعدِ check_cycle (که باید همهٔ استخر را تست کند)
@@ -600,10 +606,19 @@ async def _resolve_desired(order_id: int, healthy_rows: list) -> dict:
             .join(FactoryProxy, FactoryProxy.id == InstanceProxy.proxy_id)
             .where(InstanceProxy.order_id == int(order_id))
         )).all()
+        order = await session.get(Order, int(order_id))
     if rows:
         return _desired_from_assignments(rows)
-        
-    # 🛠 اصلاح: اگر اینستنس هیچ تخصیصی نداشت، به استخر عمومی (Legacy) برگردد
+
+    # 🩹 FIX (hard-delete): اگر ادمین اینستنس را با پنل «پروکسی اینستنس‌ها» مدیریت
+    # کرده (proxy_mode='per-instance')، حذفِ همه تخصیص‌ها یعنی «استخر اینستنس باید
+    # خالی بماند» — نباید به چرخش عمومی legacy برگردد و پروکسیِ تازه-حذف‌شده را
+    # همان سینک دوباره با is_active=1 بنویسد (این دقیقاً همان باگی بود که باعث
+    # می‌شد پروکسیِ حذف‌شده دوباره برای لاگین کاربر قابل استفاده باشد).
+    if order is not None and getattr(order, "proxy_mode", "legacy") == "per-instance":
+        return {}
+
+    # اینستنس‌های دست‌نخورده (هرگز از پنل مدیریت نشده) → استخر عمومی (Legacy)
     return _desired_for_instance(order_id, healthy_rows)
 
 # ------------------------------------------------------------
@@ -743,7 +758,8 @@ async def sync_instance_now(order_id: int) -> int:
     """
     🎯 سینک فوری «فقط همین اینستنس» (بدون انتظار برای جدول‌ها):
     پروکسی‌های تخصیص‌یافته روشن و سالم با usage_type خودشان نوشته می‌شود؛
-    بقیه ردیف‌های مدیریت‌شده غیرفعال می‌شوند. برای دکمه‌های پنل هر اینستنس.
+    ردیف‌های خارج از desired (حذف‌شده/مرده/غیرتخصیصی) به‌صورت قطعی DELETE می‌شوند.
+    برای دکمه‌های پنل هر اینستنس.
     🩹 FIX: زیر _sync_lock اجرا می‌شود — بدون قفل، هم‌زمانی با sync_all_instances
     باعث می‌شد desired کهنه، ردیف تازه-تخصیص‌یافته را DEAD/غیرفعال کند.
     """
@@ -755,6 +771,18 @@ async def sync_instance_now(order_id: int) -> int:
                 .where(FactoryProxy.status.in_(("active", "weak")))
                 .order_by(FactoryProxy.id)
             )).all()
+
+            # 🛡 گارد ایمنی (همان sync_all_instances): استخر سالم خالی = احتمالاً قطعی
+            # شبکه خود فکتوری؛ با semantics حذفِ واقعی، سینک در این حالت یعنی پاک‌شدن
+            # همه ردیف‌های اینستنس — پس متوقف می‌شود تا سیکل بعد.
+            if not rows:
+                logger.warning("استخر پروکسی‌های سالم فکتوری خالی است؛ سینک فوری bot_%s متوقف شد.", order_id)
+                await _notify(
+                    "⚠️ <b>هشدار فکتوری:</b> استخر پروکسی سالم خالی است؛ سینک فوری اینستنس‌ها "
+                    "برای جلوگیری از پاک‌شدن تصادفی ردیف‌ها لغو شد. از /proxies بررسی کنید."
+                )
+                return -1
+
             desired = await _resolve_desired(order_id, rows)
 
         try:
@@ -833,7 +861,11 @@ async def _sync_one_instance(order_id: int, desired: dict) -> None:
                 ],
             )
 
-        # ۳) غیرفعال‌سازی (به جای حذف) پروکسی‌هایی که ادمین آن‌ها را حذف یا غیرفعال کرده است
+        # ۳) 🩹 FIX (hard-delete): حذف «واقعی» پروکسی‌هایی که ادمین آن‌ها را حذف/غیرفعال
+        # کرده یا از تخصیص خارج شده‌اند — قبلاً فقط is_active=0/DEAD می‌شد که هم مونیتور
+        # سلامت سندربات زنده‌شان می‌کرد و هم در پنل مشتری به‌صورت 🔴 تلنِ می‌ماندند.
+        # اکانت‌های متصل قبل از حذف آزاد و به صف انتظار می‌روند تا با پروکسی جدید
+        # که ادمین اضافه کند دوباره claim شوند.
         to_remove = [
             ps for ps in current.keys()
             if ps in managed and ps not in desired_write
@@ -848,18 +880,16 @@ async def _sync_one_instance(order_id: int, desired: dict) -> None:
                 ),
                 {"ps": ps},
             )
-            # 🛠 اصلاح مهم: به جای حذف رکورد، آن را به عنوان یک پروکسی غیرفعال و مرده علامت‌گذاری می‌کنیم
-            # تا تاریخچه قطعی‌ها و وضعیت‌های تحلیلی اینستنس از بین نرود.
+            # 🩹 حذف قطعی ردیف — بدون هیچ مسیر بازگشتی
             await conn.execute(
                 text(
-                    f"UPDATE `{db_name}`.`proxies` "
-                    "SET is_active=0, is_healthy=0, health_state='DEAD' "
+                    f"DELETE FROM `{db_name}`.`proxies` "
                     "WHERE proxy_string = :ps"
                 ),
                 {"ps": ps},
             )
 
-    logger.info("🔄 سینک %s پروکسی به %s (%s غیرفعال شد)", len(desired_write), db_name, len(to_remove))
+    logger.info("🔄 سینک %s پروکسی به %s (%s حذف قطعی شد)", len(desired_write), db_name, len(to_remove))
 
 
 

@@ -82,6 +82,18 @@ async def init_db() -> None:
                 "MODIFY admin_id BIGINT NOT NULL"
             ))
 
+        # 🩹 FIX (hard-delete): ستون proxy_mode برای orders — idempotent
+        # (روی دیتابیس‌های موجود ALTER می‌زند؛ دیتابیس تازه را create_all با server_default می‌سازد)
+        col_check = text(
+            "SELECT COUNT(*) FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA = :db AND TABLE_NAME = 'orders' AND COLUMN_NAME = 'proxy_mode'"
+        )
+        if not (await conn.execute(col_check, {"db": db_name})).scalar():
+            logger.info("Adding orders.proxy_mode column (legacy|per-instance)...")
+            await conn.execute(text(
+                "ALTER TABLE orders ADD COLUMN proxy_mode VARCHAR(20) NOT NULL DEFAULT 'legacy'"
+            ))
+
     # پر کردن اسلات‌های redis بر اساس NUM_REDIS (idempotent)
     async with async_session() as session:
         total = await session.scalar(select(func.count(RedisSlot.slot_id))) or 0
