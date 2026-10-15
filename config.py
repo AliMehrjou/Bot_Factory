@@ -97,7 +97,6 @@ class FactoryConfig:
     # اگر هیچ‌کدام تنظیم نباشد، متن‌ها بدون ویدیو ارسال می‌شوند (بدون خطا).
     # پیشوند نوع اختیاری است:  animation:<file_id>  یا  document:<file_id>  (پیش‌فرض: video)
     TOKEN_GUIDE_VIDEO_FILE_ID: str = os.getenv("TOKEN_GUIDE_VIDEO_FILE_ID", "")
-
     VIDEO_LINK: str = os.getenv("VIDEO_LINK", "")
     # ---------- 🔧 حالت ساخت دستی ----------
     # true  = سفارش‌های پرداخت‌شده به‌جای دیپلوی خودکار، به پشتیبانی ارجاع می‌شوند
@@ -148,11 +147,7 @@ class FactoryConfig:
     PROXY_RECOVER_OKS: int = _int("PROXY_RECOVER_OKS", 2)              # موفقیت پیاپی برای بازگشت
     PROXY_WEAK_MS: int = _int("PROXY_WEAK_MS", 1200)                   # بالاتر از این = WEAK
     PROXY_CONCURRENCY: int = _int("PROXY_CONCURRENCY", 8)              # تست همزمان
-    # نوع استفاده پروکسی‌های سینک‌شده در حالت legacy (اینستنس بدون تخصیص اختصاصی)
-    # 🩹 FIX (B2): پیش‌فرض از «login» به «both» تغییر کرد — با login اینستنس‌های
-    # legacy هیچ پروکسی سندری نمی‌گرفتند چون claim سندرِ سندربات فقط
-    # ('sender','both') می‌خواند؛ both برای لاگین و ارسال هر دو کار می‌کند.
-    PROXY_USAGE_TYPE: str = os.getenv("PROXY_USAGE_TYPE", "both")     # login | sender | both
+    PROXY_USAGE_TYPE: str = os.getenv("PROXY_USAGE_TYPE", "login")     # login | send | both
     # هدف تست: DC2 تلگرام — همان مسیری که Pyrofork برای MTProto استفاده می‌کند
     PROXY_TEST_HOST: str = os.getenv("PROXY_TEST_HOST", "149.154.167.50")
     PROXY_TEST_PORT: int = _int("PROXY_TEST_PORT", 443)

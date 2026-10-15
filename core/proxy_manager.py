@@ -950,7 +950,7 @@ async def _sync_one_instance_once(order_id: int, desired: dict) -> None:
         # که ادمین اضافه کند دوباره claim شوند.
         to_remove = [
             ps for ps in current.keys()
-            if ps in managed and ps not in desired_write
+            if ps not in desired_write
         ]
         for ps in to_remove:
             # ابتدا اگر اکانتی در اینستنس به این پروکسی وصل بوده، آن را در حالت انتظار قرار می‌دهیم
