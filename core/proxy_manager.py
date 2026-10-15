@@ -588,11 +588,6 @@ def _desired_from_assignments(rows: list) -> dict:
 
 
 async def _resolve_desired(order_id: int, healthy_rows: list) -> dict:
-    """
-    منبع واحد تصمیم سینک برای هر اینستنس:
-      • تخصیص اختصاصی دارد → فقط پروکسی‌های تخصیص‌یافته روشن و سالم (با نوع خودشان)
-      • هیچ تخصیصی ندارد → حالت legacy: چرخش عمومی استخر سالم (رفتار نسخه قبل)
-    """
     async with async_session() as session:
         rows = (await session.execute(
             select(InstanceProxy, FactoryProxy)
@@ -601,7 +596,7 @@ async def _resolve_desired(order_id: int, healthy_rows: list) -> dict:
         )).all()
     if rows:
         return _desired_from_assignments(rows)
-    return _desired_for_instance(order_id, healthy_rows)
+    return {}
 
 # ------------------------------------------------------------
 # سینک به اینستنس‌ها (قسمت لاگین + سندر)
@@ -770,24 +765,7 @@ async def sync_instance_now(order_id: int) -> int:
             logger.error(f"Error syncing {order_id}: {e}")
             return -1
 
-
 async def _sync_one_instance(order_id: int, desired: dict) -> None:
-    """
-    نوشتن desired (پروکسی + usage_type مخصوص هر اینستنس) در جدول proxies اینستنس:
-      • INSERT … ON DUPLICATE KEY — usage_type جدید فقط وقتی می‌نشیند که قبلی 'both'
-        نباشد؛ 'both' (تنظیم دستی مشتری یا تخصیص هردو) همیشه حفظ می‌شود.
-      • غیرفعال‌سازی ردیف‌های مدیریت‌شده‌ای که دیگر در desired نیستند
-        (مرده / حذف تخصیص / تخصیص خاموش) — پروکسی شخصی مشتری هرگز دست نمی‌خورد.
-    🩹 FIX (B3): کلید ردیف در دیتابیس اینستنس، برای scheme های غیر socks5 با
-      پیشوند scheme نوشته می‌شود (مثلاً http://user:pass@host:port) تا سمت سندربات
-      پروتکل درست تشخیص داده شود. socks5 مثل قبل بدون پیشوند می‌ماند (سازگاری
-      کامل با ردیف‌ها/بایندهای قدیمی). ردیف‌های legacyِ پروکسی‌های غیر-socks5
-      (فرمت خام) در اولین سینک بعدی خودکار غیرفعال و با فرم درست جایگزین می‌شوند.
-    🩹 FIX (B5): ترتیب انتساب‌های ON DUPLICATE KEY UPDATE اصلاح شد —
-      consecutive_* قبل از health_state=VALUES(...) اعمال می‌شوند تا شرط
-      «قبلاً DEAD و جدید غیر-DEAD» مقدار قدیمی health_state را ببیند و
-      شمارنده‌های بازیابی هنگام خروج از DEAD واقعاً صفر شوند.
-    """
     db_name = config.db_name_for(order_id)
     from database.engine import get_shared_app_engine
     eng = get_shared_app_engine()
@@ -795,10 +773,6 @@ async def _sync_one_instance(order_id: int, desired: dict) -> None:
     from sqlalchemy import text, select
     from database.models import FactoryProxy, InstanceProxy
 
-    # رشته‌های تحت مدیریت فکتوری برای این اینستنس:
-    #   الف) همه پروکسی‌های انبار مرکزی +  ب) رشته‌های تخصیص‌یافته (حتی اگر پروکسی
-    #   از انبار حذف شده باشد) — تا هیچ ردیف مدیریتی سرگردان فعلی باقی نماند.
-    #   🩹 (B3) هر دو «فرم خام» و «فرم دارای پیشوند scheme» پوشش داده می‌شوند.
     async with async_session() as session:
         pool_rows = (await session.scalars(select(FactoryProxy))).all()
         known_to_factory = set()
@@ -813,7 +787,6 @@ async def _sync_one_instance(order_id: int, desired: dict) -> None:
         for p in assigned:
             managed.update(all_instance_db_forms(p.proxy_string, p.scheme))
 
-    # 🩹 (B3) تبدیل کلیدهای desired به کلید واقعی جدول اینستنس
     desired_write = {
         instance_db_key(ps, v.get("scheme") or "socks5"): v
         for ps, v in desired.items()
@@ -827,12 +800,7 @@ async def _sync_one_instance(order_id: int, desired: dict) -> None:
             ))).all()
         )
 
-        # ۲) درج/به‌روزرسانی پروکسی‌های سالم (با usage_type مخصوص همین اینستنس)
-        #    🩹 رفع 1364: fail_count و in_use صریحاً با 0 درج می‌شوند؛ چون ستون‌های
-        #    قدیمی proxies در سندربِات DEFAULT سطح دیتابیس ندارند و MySQL 8 با
-        #    STRICT_TRANS_TABLES درج ردیف جدید بدون آن‌ها را رد می‌کند.
-        #    شاخه UPDATE (ردیف موجود) این دو ستون را دست نمی‌زند ← شمارنده‌های
-        #    اینستنس (in_use/fail_count) دقیقاً مثل قبل محفوظ می‌مانند.
+        # ۲) درج/به‌روزرسانی پروکسی‌های سالم (با اعمال دقیق usage_type انتخابی ادمین)
         if desired_write:
             await conn.execute(
                 text(
@@ -841,11 +809,8 @@ async def _sync_one_instance(order_id: int, desired: dict) -> None:
                     "VALUES (:ps, 1, :ut, :ih, :hs, :pm, 0, 0, NOW()) "
                     "ON DUPLICATE KEY UPDATE "
                     "  is_active=1, "
-                    "  usage_type=IF(VALUES(usage_type)='both' OR usage_type='both', 'both', VALUES(usage_type)), "
+                    "  usage_type=VALUES(usage_type), "
                     "  is_healthy=VALUES(is_healthy), "
-                    # 🩹 (B5) این دو انتساب باید «قبل از» health_state=VALUES(...) بیایند
-                    # تا در شرط، مقدار قدیمی health_state دیده شود (MySQL انتساب‌ها را
-                    # چپ‌به‌راست اعمال می‌کند و ارجاع بعدی مقدار جدید را می‌بیند).
                     "  consecutive_failures=IF(health_state='DEAD' AND VALUES(health_state)<>'DEAD', 0, consecutive_failures), "
                     "  consecutive_successes=IF(health_state='DEAD' AND VALUES(health_state)<>'DEAD', 0, consecutive_successes), "
                     "  health_state=VALUES(health_state), ping_ms=VALUES(ping_ms), "
@@ -860,23 +825,35 @@ async def _sync_one_instance(order_id: int, desired: dict) -> None:
                 ],
             )
 
-        # ۳) غیرفعال‌سازی سطرهای مدیریتی که در desired نیستند
-        #    (شرط ps in managed تضمین می‌کند پروکسی شخصی کاربر را دستکاری نکنیم)
-        to_disable = [
-            ps for ps, act in current.items()
-            if act and ps in managed and ps not in desired_write
+        # ۳) غیرفعال‌سازی (به جای حذف) پروکسی‌هایی که ادمین آن‌ها را حذف یا غیرفعال کرده است
+        to_remove = [
+            ps for ps in current.keys()
+            if ps in managed and ps not in desired_write
         ]
-        for ps in to_disable:
+        for ps in to_remove:
+            # ابتدا اگر اکانتی در اینستنس به این پروکسی وصل بوده، آن را در حالت انتظار قرار می‌دهیم
             await conn.execute(
                 text(
-                    f"UPDATE `{db_name}`.`proxies` SET is_active=0, is_healthy=0, health_state='DEAD' "
+                    f"UPDATE `{db_name}`.`accounts` "
+                    "SET proxy_string=NULL, proxy_status='WAITING_PROXY', proxy_queue_joined_at=NOW() "
+                    "WHERE proxy_string = :ps"
+                ),
+                {"ps": ps},
+            )
+            # 🛠 اصلاح مهم: به جای حذف رکورد، آن را به عنوان یک پروکسی غیرفعال و مرده علامت‌گذاری می‌کنیم
+            # تا تاریخچه قطعی‌ها و وضعیت‌های تحلیلی اینستنس از بین نرود.
+            await conn.execute(
+                text(
+                    f"UPDATE `{db_name}`.`proxies` "
+                    "SET is_active=0, is_healthy=0, health_state='DEAD' "
                     "WHERE proxy_string = :ps"
                 ),
                 {"ps": ps},
             )
 
-    logger.info("🔄 سینک %s پروکسی به %s (%s غیرفعال شد)", len(desired_write), db_name, len(to_disable))
- 
+    logger.info("🔄 سینک %s پروکسی به %s (%s غیرفعال شد)", len(desired_write), db_name, len(to_remove))
+
+
 
 async def drop_engine_for(order_id: int) -> None:
     await drop_instance_engine(config.db_name_for(order_id))

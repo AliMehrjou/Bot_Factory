@@ -32,10 +32,7 @@ from utils.media_store import send_training_video
 logger = logging.getLogger(__name__)
 router = Router(name="user_order")
 
-# 🩹 FIX (R4): لیست سفید وضعیت‌های «فعال» که توکن را قفل می‌کنند.
-# نسخهٔ قبل لیست سیاه داشت (rejected/failed/destroyed) → هر وضعیت ناشناخته یا
-# گذرای آینده به‌نفع قفل شدن توکن تفسیر می‌شد و خرید مجدد بعد از حذف ناموفق/
-# نیمه‌کاره برای همیشه بلاک می‌ماند. حالا فقط وضعیت‌های واقعاً فعال قفل می‌کنند.
+
 _TOKEN_LOCKING_STATUSES = (
     "awaiting_approval",   # در انتظار تأیید پشتیبانی
     "approved",            # تأییدشده — در صف ساخت
@@ -43,7 +40,6 @@ _TOKEN_LOCKING_STATUSES = (
     "deployed",            # فعال
     "stopped",             # متوقف (داده‌ها موجود است — تمدید/استارت مجدد)
     "stopping", "starting", "destroying",  # عملیات در جریان
-    "renewed",             # تمدیدشده
     "expired",             # منقضی — فقط مسیر تمدید باز است
     "destroy_failed",      # حذف ناقص — تا تکمیل حذف، توکن قفل می‌ماند (ریسک 409)
 )
