@@ -136,13 +136,8 @@ _bg_tasks = set()
 
 async def _remove_from_all_instances(items: list) -> int:
     """
-    🩹 FIX (hard-delete): حذف «واقعی» ردیف پروکسی از دیتابیس همه اینستنس‌های زنده.
-    قبلاً فقط is_active=0/health_state='DEAD' می‌شد — اما مونیتور سلامت خود سندربات
-    (check_all_proxies هر ۶۰۰ ثانیه) ردیف‌های DEAD با consecutive_failures>0 را دوباره
-    تست می‌کرد و پس از ۲ موفقیت زنده می‌کرد؛ یعنی پروکسی‌ای که ادمین عمداً حذف
-    کرده بود، دوباره به استخر لاگین/سندر اینستنس برمی‌گشت.
-    حالا: اکانت‌های متصل آزاد و به صف انتظار می‌روند و ردیف DELETE می‌شود —
-    چیزی برای زنده‌شدن باقی نمی‌ماند.
+    حذف «واقعی» ردیف پروکسی از دیتابیس همه اینستنس‌های زنده.
+    با مکانیزم خودترمیم دسترسی (GRANT) برای دیتابیس‌های قدیمی.
     """
     if not items:
         return 0
@@ -150,6 +145,7 @@ async def _remove_from_all_instances(items: list) -> int:
     from database.engine import get_shared_app_engine
     eng = get_shared_app_engine()
 
+    from utils.proxy_parse import all_instance_db_forms
     forms = []
     for raw, scheme in items:
         forms.extend(all_instance_db_forms(raw, scheme))
@@ -164,31 +160,45 @@ async def _remove_from_all_instances(items: list) -> int:
     done = 0
     for oid in orders:
         db_name = config.db_name_for(int(oid))
+        
+        async def _execute_delete(connection):
+            # 🛠 ابتدا اکانت‌های متصل به این پروکسی‌ها را آزاد کن و به صف انتظار بفرست
+            await connection.execute(
+                _text(
+                    f"UPDATE `{db_name}`.`accounts` "
+                    "SET proxy_string=NULL, proxy_status='WAITING_PROXY', proxy_queue_joined_at=NOW() "
+                    "WHERE proxy_string IN :ps"
+                ).bindparams(bindparam("ps", expanding=True)),
+                {"ps": list(forms)},
+            )
+            # 🩹 حذف قطعی ردیف پروکسی از دیتابیس ربات مشتری
+            await connection.execute(
+                _text(
+                    f"DELETE FROM `{db_name}`.`proxies` "
+                    "WHERE proxy_string IN :ps"
+                ).bindparams(bindparam("ps", expanding=True)),
+                {"ps": list(forms)},
+            )
+
         try:
             async with eng.begin() as conn:
-                # 🛠 ابتدا اکانت‌های متصل به این پروکسی‌ها را آزاد کن و به صف انتظار بفرست
-                await conn.execute(
-                    _text(
-                        f"UPDATE `{db_name}`.`accounts` "
-                        "SET proxy_string=NULL, proxy_status='WAITING_PROXY', proxy_queue_joined_at=NOW() "
-                        "WHERE proxy_string IN :ps"
-                    ).bindparams(bindparam("ps", expanding=True)),
-                    {"ps": list(forms)},
-                )
-
-                # 🩹 حذف قطعی ردیف پروکسی از دیتابیس ربات مشتری
-                await conn.execute(
-                    _text(
-                        f"DELETE FROM `{db_name}`.`proxies` "
-                        "WHERE proxy_string IN :ps"
-                    ).bindparams(bindparam("ps", expanding=True)),
-                    {"ps": list(forms)},
-                )
+                await _execute_delete(conn)
             done += 1
         except Exception as e:
-            logger.debug("حذف %s در %s ناموفق: %s", forms[:2], db_name, e)
+            if "command denied" in str(e).lower():
+                logger.warning(f"حذف پروکسی در {db_name} با خطای دسترسی MySQL شکست خورد — تلاش برای رفع خودکار GRANT...")
+                fixed = await ensure_app_user_grants()
+                if fixed > 0:
+                    try:
+                        async with eng.begin() as conn:
+                            await _execute_delete(conn)
+                        done += 1
+                        logger.info(f"حذف پروکسی در {db_name} پس از اصلاح دسترسی با موفقیت انجام شد.")
+                    except Exception as e2:
+                        logger.error(f"حذف در {db_name} حتی پس از اصلاح دسترسی ناموفق بود: {e2}")
+            else:
+                logger.error(f"حذف {forms[:2]} در {db_name} ناموفق: {e}")
     return done
-
 
 async def ensure_app_user_grants() -> int:
     """
@@ -250,8 +260,7 @@ async def ensure_app_user_grants() -> int:
 
 async def remove_proxy(proxy_id: int) -> bool:
     """
-    حذف کامل پروکسی از استخر مرکزی + پاکسازی تخصیص‌ها + غیرفعال‌سازی در
-    دیتابیس همه اینستنس‌ها (بدون حذف ردیف — شمارنده‌های اینستنس حفظ می‌شود).
+    حذف کامل پروکسی از استخر مرکزی + پاکسازی تخصیص‌ها + حذف قطعی در دیتابیس همه اینستنس‌ها.
     """
     async with async_session() as session:
         p = await session.get(FactoryProxy, int(proxy_id))
@@ -269,11 +278,14 @@ async def remove_proxy(proxy_id: int) -> bool:
     n = await _remove_from_all_instances([(proxy_string, proxy_scheme)])
     logger.info("🗑 پروکسی %s حذف شد (ردیفش از %s دیتابیس اینستنس پاک گردید)",
                 mask_proxy(proxy_string), n)
+                
+    # ✨ جاروکشی نهایی: سینک اجباری برای اطمینان از پاک شدن هرگونه ردپای پروکسی
+    asyncio.create_task(sync_all_instances("حذف پراکسی از استخر مرکزی"))
     return True
 
 
 async def purge_dead() -> int:
-    """حذف کامل پروکسی‌های مرده از فکتوری + پاکسازی قطعی ردیف‌هایشان در اینستنس‌ها."""
+    """حذف کامل پروکسی‌های مرده از فکتوری + پاکسازی قطعی ردیف‌هایشان در اینستنس‌ها + سینک نهایی."""
     async with async_session() as session:
         dead_rows = (await session.scalars(
             select(FactoryProxy).where(FactoryProxy.status == "dead")
@@ -282,17 +294,26 @@ async def purge_dead() -> int:
         if not dead_ids:
             return 0
         dead_items = [(p.proxy_string, p.scheme) for p in dead_rows]
+        
+        # ۱) حذف تخصیص‌ها از اینستنس‌ها
         await session.execute(
             delete(InstanceProxy).where(InstanceProxy.proxy_id.in_(dead_ids)))
+            
+        # ۲) حذف قطعی از استخر مرکزی
         res = await session.execute(
             delete(FactoryProxy).where(FactoryProxy.id.in_(dead_ids)))
         await session.commit()
         n = res.rowcount or 0
 
+    # ۳) حذف قطعی ردیف‌های پراکسی مرده از دیتابیس تمام ربات‌های مشتری
     if dead_items:
         await _remove_from_all_instances(dead_items)
+        logger.info(f"🧹 تعداد {n} پراکسی مرده به صورت قطعی از دیتابیس اینستنس‌ها پاکسازی شد.")
+        
+    # ✨ ۴) جاروکشی نهایی: سینک اجباری برای پر کردن جای خالی پراکسی‌های مرده و تثبیت وضعیت شبکه
+    asyncio.create_task(sync_all_instances("حذف گروهی پراکسی‌های مرده"))
+    
     return n
-
 
 async def disable_proxy(proxy_id: int) -> bool:
     async with async_session() as session:
@@ -414,26 +435,34 @@ async def edit_central_proxy(proxy_id: int, new_raw: str) -> dict:
 # تست تک‌پروکسی
 # ------------------------------------------------------------
 async def _check_one(p: FactoryProxy) -> tuple:
-    """اتصال از طریق پروکسی به DC تلگرام؛ خروجی (ok, latency_ms|None)."""
-    # 🩹 FIX (P4): URL با اعتبارنامهٔ URL-encode شده ساخته می‌شود — پسوردهای
-    # دارای @ : / # دیگر URL را خراب نمی‌کنند و پروکسی سالم «مرده» ثبت نمی‌شود.
+    """اتصال از طریق پروکسی به DC تلگرام با مکانیزم ضد نوسان شبکه (Anti-Jitter)"""
     url = build_proxy_url(p.scheme, p.host, p.port, p.username or "", p.password or "")
-    start = time.monotonic()
-    try:
-        proxy = AsyncProxy.from_url(url)
-        sock = await asyncio.wait_for(
-            proxy.connect(dest_host=config.PROXY_TEST_HOST, dest_port=config.PROXY_TEST_PORT),
-            timeout=config.PROXY_CHECK_TIMEOUT,
-        )
-        latency = int((time.monotonic() - start) * 1000)
+    
+    # ۲ بار تلاش داخلی قبل از ثبت شکست قطعی در این سیکل
+    for attempt in range(2):
+        start = time.monotonic()
         try:
-            sock.close()
+            # در تلاش دوم، تایم‌اوت رو ۳ ثانیه بیشتر می‌کنیم تا اگر شبکه کند بود، رد بشه
+            current_timeout = config.PROXY_CHECK_TIMEOUT if attempt == 0 else config.PROXY_CHECK_TIMEOUT + 3.0
+            
+            proxy = AsyncProxy.from_url(url)
+            sock = await asyncio.wait_for(
+                proxy.connect(dest_host=config.PROXY_TEST_HOST, dest_port=config.PROXY_TEST_PORT),
+                timeout=current_timeout,
+            )
+            latency = int((time.monotonic() - start) * 1000)
+            try:
+                sock.close()
+            except Exception:
+                pass
+            return True, latency
+            
         except Exception:
-            pass
-        return True, latency
-    except Exception:
-        return False, None
-
+            if attempt == 0:
+                await asyncio.sleep(1)  # یک ثانیه تنفس قبل از تلاش مجدد
+                continue
+            return False, None
+        
 
 async def apply_manual_check_result(proxy_id: int, ok: bool, latency) -> tuple:
     async with async_session() as session:
